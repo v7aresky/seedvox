@@ -1,0 +1,398 @@
+import torch
+import torchaudio
+import argparse
+import json
+import os
+import sys
+import time
+import tempfile
+import subprocess
+import numpy as np
+from explicit_pros_phon_planner.model import ExplicitPlannerModel
+from seedvox.utils.tokenizer import CharTokenizer, PhonemeTokenizer
+from explicit_pros_phon_planner.utils import PhoneticGenerator, collate_phonemes
+
+def print_waveform(audio_tensor, width=60, height=12, sample_rate=24000):
+    """
+    Static waveform overview printed after generation.
+    """
+    audio = audio_tensor.squeeze().cpu().numpy()
+    duration = len(audio) / sample_rate
+    bin_size = max(1, len(audio) // width)
+    half = height // 2
+    bins = np.zeros(width)
+    for i in range(width):
+        chunk = audio[i * bin_size:min((i + 1) * bin_size, len(audio))]
+        if len(chunk) > 0:
+            bins[i] = np.abs(chunk).max()
+    peak = max(bins.max(), 1e-6)
+    bars = (bins / peak * half).astype(int)
+    # Compact symmetric render
+    print(f"\033[90m  {'─' * width}\033[0m")
+    for row in range(half, 0, -1):
+        line = '  '
+        for col in range(width):
+            line += '\033[36m█\033[0m' if bars[col] >= row else ' '
+        print(line)
+    print(f"\033[90m  {'─' * width}\033[0m")
+    for row in range(1, half + 1):
+        line = '  '
+        for col in range(width):
+            line += '\033[35m█\033[0m' if bars[col] >= row else ' '
+        print(line)
+    print(f"\033[90m  {'─' * width}\033[0m")
+    print(f"\033[90m  0s{' ' * (width - 7)}{duration:.1f}s\033[0m")
+
+
+def play_audio(audio_tensor, sample_rate=24000):
+    """
+    Play audio with animated waveform visualization.
+    """
+    audio_np = audio_tensor.squeeze().cpu().numpy()
+    duration = len(audio_np) / sample_rate
+    
+    # Pre-compute waveform bars — always use more bins than display width for smooth scrolling
+    view_width = 50  # fixed display width
+    height = 4  # half-height
+    n_bins = max(view_width * 3, int(duration * 30))
+    bin_size = max(1, len(audio_np) // n_bins)
+    bins_pos = np.zeros(n_bins)
+    bins_neg = np.zeros(n_bins)
+    for i in range(n_bins):
+        chunk = audio_np[i * bin_size:min((i + 1) * bin_size, len(audio_np))]
+        if len(chunk) > 0:
+            bins_pos[i] = chunk.max() if chunk.max() > 0 else 0
+            bins_neg[i] = -chunk.min() if chunk.min() < 0 else 0
+    peak = max(bins_pos.max(), bins_neg.max(), 1e-6)
+    bars_up = (bins_pos / peak * height).astype(int)
+    bars_dn = (bins_neg / peak * height).astype(int)
+    
+    # Save to temp file for playback
+    fd, tmp_path = tempfile.mkstemp(suffix='.wav')
+    os.close(fd)
+    torchaudio.save(tmp_path, audio_tensor.unsqueeze(0).cpu() if audio_tensor.dim() == 1 else audio_tensor.cpu(), sample_rate)
+    
+    # Try to start playback
+    player_proc = None
+    tried_players = []
+    for player_cmd in ['aplay', 'paplay', 'ffplay -nodisp -autoexit', 'afplay']:
+        cmd_parts = player_cmd.split()
+        try:
+            p = subprocess.Popen(cmd_parts + [tmp_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Check if it didn't immediately fail (e.g. command not found)
+            time.sleep(0.1)
+            if p.poll() is None or p.returncode == 0:
+                player_proc = p
+                break
+            else:
+                tried_players.append(f"{cmd_parts[0]} (failed)")
+        except (FileNotFoundError, OSError):
+            continue
+    
+    if player_proc is None:
+        try:
+            import sounddevice as sd
+            sd.play(audio_np, sample_rate)
+        except (ImportError, Exception):
+            print_waveform(audio_tensor, sample_rate=sample_rate)
+            try: os.remove(tmp_path)
+            except: pass
+            return False
+    
+    # Animate while audio plays
+    try:
+        total_bins = n_bins
+        total_lines = height * 2 + 1
+        sys.stdout.write('\n' * total_lines)
+        
+        start_time = time.time()
+        while True:
+            if player_proc and player_proc.poll() is not None:
+                break
+            
+            elapsed = time.time() - start_time
+            if elapsed >= duration + 0.1:
+                break
+            
+            play_pos = min(int(elapsed / duration * total_bins), total_bins)
+            window_start = max(0, play_pos - view_width + 5)
+            
+            sys.stdout.write(f"\033[{total_lines}A")
+            
+            for row in range(height * 2, 0, -1):
+                line = ' '
+                for vc in range(view_width):
+                    bin_idx = window_start + vc
+                    if bin_idx < 0 or bin_idx >= total_bins:
+                        line += ' '
+                        continue
+                    is_upper = row > height
+                    bar_val = bars_up[bin_idx] if is_upper else bars_dn[bin_idx]
+                    threshold = row - height if is_upper else height + 1 - row
+                    if bar_val >= threshold:
+                        if bin_idx < play_pos:
+                            intensity = bar_val / max(height, 1)
+                            if intensity > 0.8: line += '\033[95m█\033[0m'
+                            elif intensity > 0.5: line += '\033[96m▓\033[0m'
+                            else: line += '\033[94m░\033[0m'
+                        elif bin_idx == play_pos: line += '\033[97m▌\033[0m'
+                        else: line += ' '
+                    else: line += ' '
+                sys.stdout.write(line + '\n')
+            
+            pct = int(elapsed / duration * 100) if duration > 0 else 0
+            bar_len = 20
+            filled = int(pct / 100 * bar_len)
+            progress_bar = f"\033[36m{'━' * filled}\033[90m{'╌' * (bar_len - filled)}\033[0m"
+            sys.stdout.write(f"  \033[97m▶\033[0m {elapsed:.1f}s / {duration:.1f}s  {progress_bar} {pct}%          \n")
+            sys.stdout.flush()
+            time.sleep(0.05)
+        
+        if player_proc: player_proc.wait()
+        print(f"  \033[92m✓\033[0m Played {duration:.1f}s")
+    except KeyboardInterrupt:
+        if player_proc: player_proc.terminate()
+        print()
+    
+    try: os.remove(tmp_path)
+    except: pass
+    return True
+
+def load_audio(path, device):
+    wav, sr = torchaudio.load(path)
+    if sr != 24000: wav = torchaudio.transforms.Resample(sr, 24000)(wav)
+    if wav.shape[0] > 1: wav = wav.mean(0, keepdim=True)
+    return wav.to(device)
+
+def _sum_embeddings(emb_list, tokens, n_q):
+    ae = emb_list[0](tokens[:, 0])
+    for k in range(1, n_q):
+        ae = ae + emb_list[k](tokens[:, k])
+    return ae
+
+def run_inference(args):
+    device = torch.device(args.device)
+    
+    # 1. Load config and model
+    with open(args.config, "r") as f:
+        cfg = json.load(f)
+        
+    tokenizer = CharTokenizer()
+    model = ExplicitPlannerModel(cfg, tokenizer.vocab_size, phoneme_vocab_size=128).to(device)
+    
+    if args.checkpoint:
+        ckpt = torch.load(args.checkpoint, map_location=device)
+        if 'ema_model' in ckpt:
+            print("Loading EMA model weights...")
+            state_dict = ckpt['ema_model']
+        elif 'model' in ckpt:
+            print("Loading standard model weights...")
+            state_dict = ckpt['model']
+        else:
+            state_dict = ckpt
+        model.load_state_dict(state_dict, strict=False)
+    
+    if args.dtype == 'bf16':
+        print("Casting model to bfloat16...")
+        model = model.to(torch.bfloat16)
+    elif args.dtype == 'fp16':
+        print("Casting model to float16...")
+        model = model.half()
+    
+    model.eval()
+
+    # Load Mimi
+    from seedvox.modules.mimi import get_mimi_model
+    mimi = get_mimi_model(device=device, checkpoint_path=cfg.get('mimi_checkpoint', 'pretrained_models/best_mimi.pt')).eval()
+    
+    # 2. Text processing
+    text = args.text
+    print(f"Input Text: '{text}'")
+    t_ids = torch.tensor([tokenizer.encode(text)], device=device)
+    t_lens = torch.tensor([t_ids.shape[1]], device=device)
+    
+    metrics = {}
+    total_start = time.time()
+    
+    # 3. Phonetic Planning (CoT step 1)
+    ph_start = time.time()
+    
+    dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16 if args.dtype == 'fp16' else torch.float32
+    autocast_enabled = args.dtype != 'fp32'
+
+    if args.overwrite_phonemes:
+        print(f"Overwriting phonemes with: {args.overwrite_phonemes}")
+        ph_tokenizer = PhonemeTokenizer()
+        # Simple encoding, adding SOS/EOS
+        ph_ids_list = ph_tokenizer.encode(args.overwrite_phonemes)
+        # SOS=3, EOS=model.EOS_ID
+        ph_ids = torch.tensor([[model.SOS_ID] + ph_ids_list + [model.EOS_ID]], device=device)
+    elif args.use_external_g2p:
+        print(f"Using external G2P ({args.g2p}) for phonemes...")
+        generator = PhoneticGenerator(backend=args.g2p, phoneme_vocab_size=model.EOS_ID)
+        ph_ids_list = generator.generate_targets(text)
+        ph_ids = torch.tensor([ph_ids_list], device=device)
+        ph_tokenizer = PhonemeTokenizer()
+        clean_tokens = [t for t in ph_ids_list if t != model.SOS_ID and t != model.EOS_ID]
+        print(f"G2P Phonemes: {ph_tokenizer.decode(clean_tokens)}")
+    else:
+        # Sample from phonetic_planner
+        # Use joint Char + BPE features
+        bpe_ids, bpe_lens, char_to_bpe = None, None, None
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                if model.use_bpe_encoder:
+                    from seedvox.utils.tokenizer import BPECharCollator
+                    bpe_collator = BPECharCollator(model.bpe_encoder)
+                    bpe_ids, bpe_lens, char_to_bpe = bpe_collator.process_batch_texts([text], t_lens, device)
+                    # Display BPE tokens
+                    decoded_bpe = model.bpe_encoder.bpe_tokenizer.decode(bpe_ids[0].tolist())
+                    print(f"BPE Tokens: '{decoded_bpe}'")
+
+                text_feat = model.get_enriched_text_feat(
+                    t_ids, t_lens, raw_texts=[text],
+                    bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe
+                )
+                # Use the sample method with the model's EOS_ID
+                ph_ids = model.phonetic_planner.sample(text_feat, temp=args.phoneme_temp, top_p=args.phoneme_top_p)
+                ph_tokenizer = PhonemeTokenizer()
+                # Filter out SOS/EOS for cleaner display
+                tokens = ph_ids[0].tolist()
+                clean_tokens = [t for t in tokens if t != model.SOS_ID and t != model.EOS_ID]
+                print(f"Planned Phonemes: {ph_tokenizer.decode(clean_tokens)}")
+    metrics['phonetic_planning_ms'] = (time.time() - ph_start) * 1000
+
+    # 4. Speaker and Prosody Conditioning
+    cond_start = time.time()
+    ext_spk = None
+    if args.ref_wav_speaker:
+        print(f"Extracting speaker from {args.ref_wav_speaker}...")
+        wav = load_audio(args.ref_wav_speaker, device)
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                mimi_toks = mimi.encode(wav.unsqueeze(0))
+                ae = _sum_embeddings(model.audio_embs, mimi_toks, model.n_q)
+                ae = model.audio_prenet(model.audio_norm(ae))
+                ext_spk = model.speaker_encoder(ae)
+    elif args.random_speaker:
+        print("Sampling random speaker...")
+        num_spk = model.cfg.get('num_speaker_latents', 16)
+        ext_spk = torch.randn(1, num_spk, model.dim, device=device)
+
+    ext_prs = None
+    if args.ref_wav_prosody:
+        print(f"Extracting prosody from {args.ref_wav_prosody}...")
+        wav = load_audio(args.ref_wav_prosody, device)
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                mimi_toks = mimi.encode(wav.unsqueeze(0))
+                # JEPA model uses prosody_bottleneck for Mimi latents, 
+                # but for audio tokens we use prosody_encoder
+                ae = _sum_embeddings(model.audio_embs, mimi_toks, model.n_q)
+                ae = model.audio_prenet(model.audio_norm(ae))
+                ext_prs = model.prosody_encoder(ae)
+    elif args.random_prosody:
+        print("Sampling random prosody...")
+        num_prs = model.cfg.get('num_prosody_tokens', 32)
+        ext_prs = torch.randn(1, num_prs, model.dim, device=device)
+    metrics['conditioning_ms'] = (time.time() - cond_start) * 1000
+
+    # 5. Acoustic Generation (CoT step 2)
+    ac_start = time.time()
+    
+    dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16 if args.dtype == 'fp16' else torch.float32
+    autocast_enabled = args.dtype != 'fp32'
+    
+    with torch.no_grad():
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+            # Ensure BPE is passed here too
+            audio_tokens, _ = model.sample(
+                t_ids, t_lens, 
+                phoneme_ids=ph_ids,
+                temp=args.temp,
+                cfg_scale=args.cfg,
+                bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
+                external_speaker=ext_spk,
+                external_prosody=ext_prs
+            )
+            
+            # Extract prosody embeddings for visualization
+            context, _, _ = model.encode_context(
+                t_ids, t_lens, audio_tokens, None, [text], 
+                phoneme_ids=ph_ids,
+                bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
+                external_speaker=ext_spk,
+                external_prosody=ext_prs
+            )
+        
+        spk_len = model.cfg['num_speaker_latents'] if model.use_speaker else 0
+        prs_len = model.cfg.get('num_prosody_tokens', 32)
+        prosody_embs = context[:, spk_len : spk_len + prs_len, :]
+        torch.save(prosody_embs.cpu(), "prosody_embs.pt")
+        print(f"Saved prosody embeddings to prosody_embs.pt, shape: {prosody_embs.shape}")
+    metrics['acoustic_gen_ms'] = (time.time() - ac_start) * 1000
+    
+    # 6. Decode with Mimi
+    dec_start = time.time()
+    with torch.no_grad():
+        wav = mimi.decode(audio_tokens)
+    metrics['mimi_decode_ms'] = (time.time() - dec_start) * 1000
+    
+    total_time = time.time() - total_start
+    audio_duration = wav.shape[2] / 24000
+    rtf = total_time / audio_duration if audio_duration > 0 else 0
+    
+    torchaudio.save(args.output, wav[0].cpu(), 24000)
+    print(f"Saved generated audio to {args.output}")
+
+    if args.log_metrics:
+        print("\n" + "="*30)
+        print("Performance Metrics:")
+        print(f"  Phonetic Planning: {metrics['phonetic_planning_ms']:.2f}ms")
+        print(f"  Conditioning:      {metrics['conditioning_ms']:.2f}ms")
+        print(f"  Acoustic Gen:      {metrics['acoustic_gen_ms']:.2f}ms")
+        print(f"  Mimi Decode:       {metrics['mimi_decode_ms']:.2f}ms")
+        print("-" * 30)
+        print(f"  Total Latency:     {total_time*1000:.2f}ms")
+        print(f"  Audio Duration:    {audio_duration:.2f}s")
+        print(f"  Real-time Factor:  {rtf:.4f}x")
+        print("="*30 + "\n")
+
+    if args.view_waveform:
+        print_waveform(wav[0])
+    
+    if args.play:
+        play_audio(wav[0])
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--text", type=str, required=True)
+    parser.add_argument("--config", default="configs/default.json")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/seedvox_latest.pt")
+    parser.add_argument("--output", default="output.wav")
+    parser.add_argument("--overwrite_phonemes", type=str, default=None)
+    parser.add_argument("--use_external_g2p", action="store_true", help="Use external G2P instead of phonetic planner")
+    parser.add_argument("--g2p", default="espeak", help="G2P backend to use with --use_external_g2p")
+    parser.add_argument("--temp", type=float, default=0.1)
+    parser.add_argument("--cfg", type=float, default=1.0)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", choices=['fp32', 'fp16', 'bf16'], default='fp32', help="Inference precision")
+    
+    # New speaker/prosody options
+    parser.add_argument("--ref_wav_speaker", type=str, default=None)
+    parser.add_argument("--ref_wav_prosody", type=str, default=None)
+    parser.add_argument("--random_speaker", action="store_true")
+    parser.add_argument("--random_prosody", action="store_true")
+    
+    # Phoneme sampling
+    parser.add_argument("--phoneme_temp", type=float, default=1.0)
+    parser.add_argument("--phoneme_top_p", type=float, default=0.9)
+
+    # Visualization and playback
+    parser.add_argument("--play", action="store_true", help="Play audio after generation")
+    parser.add_argument("--view_waveform", action="store_true", help="View static waveform")
+    parser.add_argument("--log_metrics", action="store_true", help="Log performance metrics (latency, RTF)")
+    
+    args = parser.parse_args()
+    run_inference(args)
+

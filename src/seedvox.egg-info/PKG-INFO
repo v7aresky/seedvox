@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: seedvox
+Version: 0.1.0
+Requires-Python: >=3.9
+Requires-Dist: sphn
+Requires-Dist: torch
+Requires-Dist: torchaudio
+Requires-Dist: transformers
+Requires-Dist: tqdm
+Requires-Dist: numpy
+Requires-Dist: g2p_en
+Requires-Dist: phonemizer
+Requires-Dist: safetensors
+Dynamic: requires-dist
+Dynamic: requires-python

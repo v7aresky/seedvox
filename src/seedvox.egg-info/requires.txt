@@ -1,0 +1,9 @@
+sphn
+torch
+torchaudio
+transformers
+tqdm
+numpy
+g2p_en
+phonemizer
+safetensors

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seedvox"
+version = "0.1.0"
+authors = [
+  { name="SeedVox Contributors" },
+]
+description = "Hybrid speech synthesis with JEPA-based prosody planning."
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+    "numpy",
+    "einops",
+    "tqdm",
+    # Add other dependencies from requirements.txt as needed
+]
+
+[tool.setuptools]
+packages = ["seedvox", "explicit_pros_phon_planner"]
+EOF
