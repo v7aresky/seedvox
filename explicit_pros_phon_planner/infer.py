@@ -8,7 +8,15 @@ import time
 import tempfile
 import subprocess
 import numpy as np
+from pathlib import Path
+
+# Add project root and src to sys.path
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(root_dir))
+sys.path.insert(0, str(root_dir / "src"))
+
 from explicit_pros_phon_planner.model import ExplicitPlannerModel
+
 from seedvox.utils.tokenizer import CharTokenizer, PhonemeTokenizer
 from explicit_pros_phon_planner.utils import PhoneticGenerator, collate_phonemes
 
@@ -405,7 +413,7 @@ def run_inference(args):
     print("Encoding context and planning prosody...")
     with torch.no_grad():
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-            context, ctx_mask, _ = model.encode_context(
+            context, ctx_mask, _, _, _ = model.encode_context(
                 t_ids, t_lens, raw_texts=[text], 
                 phoneme_ids=ph_ids,
                 bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
@@ -445,7 +453,7 @@ def run_inference(args):
         # (This avoids polluting the main sample timing)
         print("Extracting prosody embeddings for viz...")
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-            context, _, _ = model.encode_context(
+            context, _, _, _, _ = model.encode_context(
                 t_ids, t_lens, audio_tokens, None, [text], 
                 phoneme_ids=ph_ids,
                 bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,

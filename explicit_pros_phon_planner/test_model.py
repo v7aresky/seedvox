@@ -1,6 +1,15 @@
 import torch
 import json
+from pathlib import Path
+import sys
+
+# Add project root and src to sys.path
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(root_dir))
+sys.path.insert(0, str(root_dir / "src"))
+
 from explicit_pros_phon_planner.model import ExplicitPlannerModel
+
 from seedvox.utils.tokenizer import CharTokenizer
 
 def test_model_forward():

@@ -77,7 +77,7 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
                        drop_prob=0.0, external_speaker=None, external_prosody=None):
         
         # 1. Get Base Context (Speaker, Prosody, Text)
-        context, ctx_mask, _ = super().encode_context(
+        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss = super().encode_context(
             text, text_lens, audio_tokens, audio_lens, raw_texts,
             use_speaker, use_prosody, phoneme_ids=None, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
@@ -120,9 +120,9 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
             ph_mask = (phoneme_ids == 0) # True for padding
             new_mask = torch.cat([ctx_mask[:, :spk_len + prs_len], ph_mask, ctx_mask[:, spk_len + prs_len:]], dim=1)
             
-            return new_context, new_mask, None
+            return new_context, new_mask, ph_logits, jepa_loss, contrastive_loss
             
-        return context, ctx_mask, None
+        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss
 
     def forward(self, text, audio_tokens, text_lens, audio_lens, raw_texts=None, 
                 use_speaker=None, use_prosody=None, phoneme_ids=None, mimi_latents=None,
@@ -143,7 +143,7 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
         if audio_tokens is not None:
             audio_tokens = audio_tokens[:, :self.n_q]
             
-        context, ctx_mask, _ = self.encode_context(
+        context, ctx_mask, _, jepa_loss, _ = self.encode_context(
             text, text_lens, audio_tokens, audio_lens, raw_texts, 
             use_speaker, use_prosody, phoneme_ids, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
@@ -152,4 +152,4 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
         
         logits, targets = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens)
         
-        return logits, targets, ph_planner_logits, self._jepa_loss
+        return logits, targets, ph_planner_logits, jepa_loss, None

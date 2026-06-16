@@ -21,6 +21,7 @@
     "use_prosody": true,
     "use_jepa_planner": true,
     "use_phonetic": true,
+    "use_explicit_planner": true,
     "bpe_encoder": {
       "enabled": true,
       "bpe_layers": 2,
@@ -30,16 +31,28 @@
     }
   },
   "training": {
-    "batch_size": 16,
+    "batch_size": 12,
     "num_workers": 8,
-    "lr": 1e-5,
+    "lr": 1e-4,
+    "ph_pretrain_path": "pretrained_models/phonetic_head_pretrain.pt",
+    "param_groups": [
+      {
+        "keywords": ["text_emb", "text_encoder"],
+        "lr": 1e-6
+      },
+      {
+        "keywords": ["phonetic_planner","ph_decoder_emb", "film_phn", "film_prs"],
+        "lr": 1e-6
+      }
+    ],
     "warmup_steps": 2000,
+
     "epochs": 100,
     "train_tokens_path": [
-      "../autovoc/dataset/hifitts/train_tokens_hifitts.pt"
+      "../autovoc/dataset/train_tokens_hifi_24q.pt"
     ],
     "output_prefix": "seedvox_",
-    "jepa_weight": 2.0,
+    "jepa_weight": 0.5,
     "ph_weight": 0.6,
     "dur_weight": 0.08,
     "val_ratio": 0.02,

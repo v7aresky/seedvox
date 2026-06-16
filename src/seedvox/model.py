@@ -198,6 +198,7 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
         
         pred_prosody = self.jepa_planner(text_feat_text_rate, text_mask=t_mask)
         
+        jepa_loss = None
         if external_prosody is not None:
             current_prosody = external_prosody
         elif mimi_latents is not None:
@@ -207,12 +208,11 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                 gt_prosody = self.prosody_bottleneck(mimi_latents, mask=a_mask).detach()
             
             # Compute JEPA Loss (Targeting the teacher)
-            self._jepa_loss = F.mse_loss(pred_prosody, gt_prosody)
+            jepa_loss = F.mse_loss(pred_prosody, gt_prosody)
             current_prosody = pred_prosody
         else:
             # Inference mode
             current_prosody = pred_prosody
-            self._jepa_loss = None
 
         # 5. Speaker Adaptation (FiLM)
         speaker_vector = spk.mean(dim=1, keepdim=True) if spk is not None else torch.zeros(B, 1, self.dim, device=device)
@@ -244,7 +244,7 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
             
         # 8. Phonetic Head
         ph_logits = None
-        self._contrastive_loss = None
+        contrastive_loss = None
         if self.use_phonetic:
             if phoneme_ids is not None:
                 if phoneme_ids.shape[1] == text.shape[1]:
@@ -254,13 +254,12 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                     phoneme_ids = padded_ph_ids
             
             contrastive_loss, _, ph_logits = self.phoneme_head(text_feat, text_lens_wrapped, phoneme_ids)
-            self._contrastive_loss = contrastive_loss
             
-        return context, ctx_mask, ph_logits
+        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss
 
     def mlm_forward(self, masked_text, text_lens, raw_texts=None, phoneme_ids=None,
                     bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None):
-        context, ctx_mask, ph_logits = self.encode_context(
+        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss = self.encode_context(
             masked_text, text_lens, raw_texts=raw_texts, phoneme_ids=phoneme_ids,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens
         )
@@ -271,14 +270,14 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                 bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
                 drop_prob=0.0):
         audio_tokens = audio_tokens[:, :self.n_q]
-        context, ctx_mask, ph_logits = self.encode_context(
+        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss = self.encode_context(
             text, text_lens, audio_tokens, audio_lens, raw_texts, 
             use_speaker, use_prosody, phoneme_ids, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
             drop_prob=drop_prob
         )
         logits, targets = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens)
-        return logits, targets, ph_logits, self._jepa_loss, self._contrastive_loss
+        return logits, targets, ph_logits, jepa_loss, contrastive_loss
 
     @torch.no_grad()
     def sample(self, text, text_lens, ref_audio=None, ref_lens=None, max_steps=1000, temp=0.1, curr_n_q=None, raw_texts=None, top_k=0, top_p=0.9, use_speaker=None, use_prosody=None, cfg_scale=1.0,
@@ -292,7 +291,7 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
         if precomputed_context is not None:
             context, ctx_mask = precomputed_context, precomputed_mask
         else:
-            context, ctx_mask, _ = self.encode_context(
+            context, ctx_mask, _, _, _ = self.encode_context(
                 text, text_lens, audio_tokens=ref_audio, audio_lens=ref_lens, 
                 raw_texts=raw_texts, use_speaker=use_speaker, use_prosody=use_prosody,
                 bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
