@@ -18,36 +18,31 @@ class ExplicitCollate:
     def __call__(self, batch):
         self.total_batches += 1
         # 1. Base Collate (Pads audio/text)
-        padded_text, padded_audio, t_lens, a_lens, raw_texts = collate_fn(batch)
+        # raw_texts is now the normalized text from Dataset.__getitem__
+        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds = collate_fn(batch)
         
-        # 2. Parallel G2P (Runs in the DataLoader worker process)
+        # 2. Use precomputed phonemes if available
+        if ph_ids_from_ds is not None:
+             return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds
+
+        # 3. Parallel G2P (Fallback)
         try:
-            # FIX: Call g2p on each sentence individually
-            batch_phonemes = [self.ph_generator.g2p(text) for text in raw_texts]
-            
-            ph_target_list = [self.ph_generator.generate_targets_from_phonemes(p) for p in batch_phonemes]
+            # Note: raw_texts is already normalized, so we pass normalize=False
+            ph_target_list = self.ph_generator.generate_targets_batch(raw_texts, normalize=False)
             ph_targets = collate_phonemes(ph_target_list)
         except Exception as e:
             self.failure_count += 1
             failure_rate = self.failure_count / self.total_batches
-            
-            # Prevent worker crash, try fallback or return dummy targets
             print(f"Error in Parallel G2P worker: {e}. Failure rate: {failure_rate:.2%}")
             
             if failure_rate > self.failure_threshold:
-                raise RuntimeError(f"G2P failure rate exceeded threshold! Consistent failure detected: {failure_rate:.2%}")
+                raise RuntimeError(f"G2P failure rate exceeded threshold!")
 
             try:
-                from seedvox.utils.g2p_factory import G2PEnGenerator
-                fallback_gen = G2PEnGenerator()
-                # FIX: Call g2p on each sentence individually
-                batch_phonemes = [fallback_gen(text) for text in raw_texts]
-                
-                ph_target_list = [self.ph_generator.generate_targets_from_phonemes(p) for p in batch_phonemes]
+                # Direct fallback (sequential if batch fails)
+                ph_target_list = [self.ph_generator.generate_targets(text, normalize=False) for text in raw_texts]
                 ph_targets = collate_phonemes(ph_target_list)
-                print("Fallback successful.")
             except Exception as e2:
-                print(f"Fallback failed: {e2}. Returning dummy targets.")
                 ph_targets = torch.zeros((len(raw_texts), 2), dtype=torch.long)
         
         return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets
@@ -64,18 +59,30 @@ class ExplicitTrainer(SeedVoxTrainer):
         if num_workers is not None:
             self.cfg['training']['num_workers'] = num_workers
         
-        # Capture the base generator from the parent class
-        self.ph_generator_base = self.ph_generator
-        
         # Replace the model with the Explicit version
         self.model = ExplicitPlannerModel(config, self.tokenizer.vocab_size, phoneme_vocab_size=128).to(device)
         self.ema_model = ExplicitPlannerModel(config, self.tokenizer.vocab_size, phoneme_vocab_size=128).to(device)
         self.ema_model.eval()
         for p in self.ema_model.parameters(): p.requires_grad = False
+
+        # Load phonetic pretrain if available (Critical fix: super().__init__ loads it but we overwrite model above)
+        ph_pretrain_path = self.cfg['training'].get('ph_pretrain_path')
+        if ph_pretrain_path and os.path.exists(ph_pretrain_path):
+            print(f"Loading pre-trained phonetic weights from {ph_pretrain_path}...")
+            ph_ckpt = torch.load(ph_pretrain_path, map_location=device, weights_only=False)
+            ph_sd = ph_ckpt.get('model_state', ph_ckpt)
+            
+            # Synchronize ph_decoder_emb with phonetic_planner.phoneme_emb
+            if 'phonetic_planner.phoneme_emb.weight' in ph_sd and hasattr(self.model, 'ph_decoder_emb'):
+                with torch.no_grad():
+                    self.model.ph_decoder_emb.weight.copy_(ph_sd['phonetic_planner.phoneme_emb.weight'])
+                    self.ema_model.ph_decoder_emb.weight.copy_(ph_sd['phonetic_planner.phoneme_emb.weight'])
+            
+            self.model.load_state_dict(ph_sd, strict=False)
+            self.ema_model.load_state_dict(ph_sd, strict=False)
         
-        # Initialize the wrapper generator
+        # Initialize the wrapper generator correctly
         self.ph_generator = PhoneticGenerator(backend=g2p_backend, phoneme_vocab_size=128)
-        self.ph_generator.g2p = self.ph_generator_base # Reuse the base generator from SeedVoxTrainer
         
         # Override the DataLoader to use the Parallel G2P Collator
         self._reinit_dataloader()
@@ -84,7 +91,7 @@ class ExplicitTrainer(SeedVoxTrainer):
         # Define weights to prioritize EOS token (index 128)
         # Assuming phoneme_vocab_size + 1 = 129
         weights = torch.ones(129, device=device)
-        weights[128] = 5.0 
+        weights[128] = 2.0 
         self.ph_planner_criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=0)
 
         # Load weights
@@ -109,16 +116,18 @@ class ExplicitTrainer(SeedVoxTrainer):
 
     def _reinit_dataloader(self):
         """Re-initializes the DataLoader with the parallel G2P collator."""
-        train_paths = self.cfg['training']['train_tokens_path']
-        if isinstance(train_paths, str): train_paths = [train_paths]
-        
-        full_ds = TokenizedSpeechDataset(train_paths, self.tokenizer)
-        val_ratio = self.cfg['training'].get('val_ratio', 0.05)
-        n_val = max(1, int(len(full_ds) * val_ratio))
-        n_train = len(full_ds) - n_val
-        
-        indices = torch.randperm(len(full_ds)).tolist()
-        train_ds = Subset(full_ds, indices[:n_train])
+        # Reuse dataset from super() if available to avoid double loading
+        if hasattr(self, 'loader'):
+            train_ds = self.loader.dataset
+        else:
+            train_paths = self.cfg['training']['train_tokens_path']
+            if isinstance(train_paths, str): train_paths = [train_paths]
+            full_ds = TokenizedSpeechDataset(train_paths, self.tokenizer)
+            val_ratio = self.cfg['training'].get('val_ratio', 0.05)
+            n_val = max(1, int(len(full_ds) * val_ratio))
+            n_train = len(full_ds) - n_val
+            indices = torch.randperm(len(full_ds)).tolist()
+            train_ds = Subset(full_ds, indices[:n_train])
         
         # Use our custom collator
         collate = ExplicitCollate(self.ph_generator)
@@ -147,7 +156,7 @@ class ExplicitTrainer(SeedVoxTrainer):
         with torch.no_grad():
             mimi_latents = self.mimi.decode_latent(padded_audio[:, :self.model.n_q//2])
             
-        logits, targets, ph_planner_logits, jepa_loss = self.model(
+        logits, targets, ph_planner_logits, jepa_loss, _ = self.model(
             padded_text, padded_audio[:, :self.model.n_q], t_lens, a_lens, raw_texts=raw_texts,
             phoneme_ids=ph_targets, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,

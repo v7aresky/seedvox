@@ -10,8 +10,10 @@ from seedvox.modules.components import (
 
 # Shared helper
 def _sum_embeddings(emb_list, tokens, n_q):
+    # Only iterate up to the number of codebooks present in tokens or n_q, whichever is smaller
+    num_codebooks = min(tokens.shape[1], n_q)
     ae = emb_list[0](tokens[:, 0])
-    for k in range(1, n_q):
+    for k in range(1, num_codebooks):
         ae = ae + emb_list[k](tokens[:, k])
     return ae
 

@@ -15,20 +15,25 @@ class TokenizedSpeechDataset(Dataset):
                 elif isinstance(raw, list): self.data.extend(raw)
         self.tokenizer = tokenizer
         # Pre-calculate lengths to avoid calling it in Sampler
-        print(f"Pre-calculating dataset lengths for {len(self.data)} items...")
-        self.lengths = [item['audio_tokens'].shape[-1] for item in self.data]
+        from tqdm import tqdm
+        self.lengths = []
+        for item in tqdm(self.data, desc="Pre-calculating dataset lengths"):
+            self.lengths.append(item['audio_tokens'].shape[-1])
         
     def __len__(self): return len(self.data)
     def __getitem__(self, idx):
         item = self.data[idx]
-        text_ids = torch.tensor(self.tokenizer.encode(item['text']), dtype=torch.long)
+        from seedvox.utils.text import normalize_text
+        # Use pre-normalized text if available, otherwise normalize now
+        norm_text = item.get('normalized_text', normalize_text(item['text']))
+        text_ids = torch.tensor(self.tokenizer.encode(norm_text, normalize=False), dtype=torch.long)
         audio_tokens = item['audio_tokens'].squeeze(0)
         ph_ids = item.get('ph_ids')
         if ph_ids is not None:
             # Ensure it is a tensor
             if not isinstance(ph_ids, torch.Tensor):
                 ph_ids = torch.tensor(ph_ids, dtype=torch.long)
-        return text_ids, audio_tokens, item['text'], ph_ids
+        return text_ids, audio_tokens, norm_text, ph_ids
 
 class LengthGroupedSampler(Sampler):
     def __init__(self, dataset, batch_size):
@@ -61,10 +66,16 @@ def collate_fn(batch):
     padded_text = torch.full((len(text_ids), t_max), 0, dtype=torch.long)
     for i, t in enumerate(text_ids): padded_text[i, :len(t)] = t
     
+    # Dynamically find max K (codebooks) and max T (sequence length)
+    k_max = max(a.shape[0] for a in audio_tokens)
+    a_max = max(a.shape[1] for a in audio_tokens)
+    a_max = ((a_max + 7) // 8) * 8
+    
+    padded_audio = torch.zeros(len(audio_tokens), k_max, a_max, dtype=torch.long)
+    for i, a in enumerate(audio_tokens): 
+        padded_audio[i, :a.shape[0], :a.shape[1]] = a
+    
     a_lens = torch.tensor([a.shape[1] for a in audio_tokens], dtype=torch.long)
-    a_max = ((a_lens.max().item() + 7) // 8) * 8
-    padded_audio = torch.zeros(len(audio_tokens), audio_tokens[0].shape[0], a_max, dtype=torch.long)
-    for i, a in enumerate(audio_tokens): padded_audio[i, :, :a.shape[1]] = a
     
     # Handle ph_ids (might be None)
     padded_ph = None

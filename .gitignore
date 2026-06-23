@@ -32,3 +32,6 @@ EOF
 
 # Windows metadata
 *:Zone.Identifier
+
+# tmp files
+*.*~

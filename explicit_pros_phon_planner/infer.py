@@ -1,4 +1,5 @@
 import torch
+import torch._dynamo
 import torchaudio
 import argparse
 import json
@@ -16,6 +17,7 @@ sys.path.insert(0, str(root_dir))
 sys.path.insert(0, str(root_dir / "src"))
 
 from explicit_pros_phon_planner.model import ExplicitPlannerModel
+from explicit_pros_phon_planner.model_fusion import FusionPlannerModel
 
 from seedvox.utils.tokenizer import CharTokenizer, PhonemeTokenizer
 from explicit_pros_phon_planner.utils import PhoneticGenerator, collate_phonemes
@@ -102,16 +104,12 @@ def print_waveform(audio_tensor, width=80, height=3, sample_rate=24000):
 
 
 def play_audio_v5(audio_tensor, sample_rate=24000):
-    """
-    Play audio with an ultra-high resolution Braille reveal animation.
-    """
-    print("\n\033[94m[DEBUG] Active Animation: Ultra-Res Braille (v5)\033[0m")
     
     audio_np = audio_tensor.squeeze().cpu().numpy()
     duration = len(audio_np) / sample_rate
     
     width = 80
-    height = 2 # 2 rows above, 2 below = 16 dots total vertical
+    height = 4 # 4 rows above, 4 below = 32 dots total vertical
     w_dots = width * 2
     h_dots_half = height * 4
     
@@ -180,7 +178,7 @@ def play_audio_v5(audio_tensor, sample_rate=24000):
                     
                     if tc < play_pos_tc:
                         avg_h = (d_cols[0] + d_cols[1]) / 2 / h_dots_half
-                        color = "\033[96m" if avg_h > 0.5 else "\033[36m"
+                        color = "\033[38;2;255;20;147m" if avg_h > 0.5 else "\033[38;5;205m"  #"\033[96m" "\033[36m"
                         line += f"{color}{char}\033[0m"
                     else:
                         # Cursor leading edge
@@ -249,7 +247,32 @@ def run_inference(args):
         cfg = json.load(f)
         
     tokenizer = CharTokenizer()
-    model = ExplicitPlannerModel(cfg, tokenizer.vocab_size, phoneme_vocab_size=128).to(device)
+    
+    # Factory: Choose model class based on config (with CLI override & auto-detection from checkpoint)
+    use_fusion = args.use_linguistic_fusion or cfg['model'].get('use_linguistic_fusion', False)
+    
+    if args.checkpoint:
+        try:
+            ckpt_temp = torch.load(args.checkpoint, map_location='cpu')
+            state_dict_temp = ckpt_temp.get('model', ckpt_temp.get('ema_model', ckpt_temp))
+            has_fusion_keys = any(k.startswith('linguistic_fusion') for k in state_dict_temp.keys())
+            if has_fusion_keys and not use_fusion:
+                print("\033[93m[Auto-detect]\033[0m Detected 'linguistic_fusion' keys in checkpoint. Automatically enabling FusionPlannerModel.")
+                use_fusion = True
+            elif not has_fusion_keys and use_fusion:
+                print("\033[93m[Warning]\033[0m use_linguistic_fusion is enabled but checkpoint does not contain 'linguistic_fusion' keys. Bypassing fusion.")
+                use_fusion = False
+        except Exception as e:
+            print(f"\033[91m[Auto-detect Error]\033[0m Failed to pre-scan checkpoint: {e}")
+            
+    if use_fusion:
+        print("\033[94m[Inference]\033[0m Using FusionPlannerModel (Unified Linguistic Encoder)")
+        model_cls = FusionPlannerModel
+    else:
+        print("\033[94m[Inference]\033[0m Using ExplicitPlannerModel")
+        model_cls = ExplicitPlannerModel
+        
+    model = model_cls(cfg, tokenizer.vocab_size, phoneme_vocab_size=128).to(device)
     
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device)
@@ -267,6 +290,20 @@ def run_inference(args):
                 print(f"@@@@ Loading model weights from {args.checkpoint}...")
             state_dict = ckpt
         model.load_state_dict(state_dict, strict=False)
+
+    if args.ph_checkpoint:
+        print(f"@@@@@ Overloading phonetic weights from {args.ph_checkpoint}...")
+        ph_ckpt = torch.load(args.ph_checkpoint, map_location=device)
+        ph_sd = ph_ckpt['model_state'] if 'model_state' in ph_ckpt else ph_ckpt
+        
+        # Explicitly check and copy weights for ph_decoder_emb from phonetic_planner.phoneme_emb if possible
+        # to ensure the acoustic model uses the same embeddings as the planner
+        if 'phonetic_planner.phoneme_emb.weight' in ph_sd and hasattr(model, 'ph_decoder_emb'):
+            with torch.no_grad():
+                model.ph_decoder_emb.weight.copy_(ph_sd['phonetic_planner.phoneme_emb.weight'])
+        
+        msg = model.load_state_dict(ph_sd, strict=False)
+        print(f"Loaded phonetic weights. Incompatible keys: {msg.unexpected_keys if msg.unexpected_keys else 'None'}")
     
     if args.dtype == 'bf16':
         print("Casting model to bfloat16...")
@@ -275,7 +312,8 @@ def run_inference(args):
         print("Casting model to float16...")
         model = model.half()
     
-    model.eval()
+    dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16 if args.dtype == 'fp16' else torch.float32
+    autocast_enabled = args.dtype != 'fp32'
 
     # Load Mimi
     from seedvox.modules.mimi import get_mimi_model
@@ -288,6 +326,8 @@ def run_inference(args):
         inductor_config.fx_graph_cache = True
         # Prioritize faster startup for cache hits
         inductor_config.compile_threads = 8 
+        # Prevent recompiles from integer module attributes (e.g. streaming offset)
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
         
         # Set a project-local cache directory
         cache_dir = os.path.join(os.getcwd(), ".torch_compile_cache")
@@ -300,7 +340,21 @@ def run_inference(args):
         
         # Mode "reduce-overhead" uses CUDA graphs to eliminate CPU launch overhead
         # which is perfect for AR loops like our acoustic generator.
-        model = torch.compile(model, mode="reduce-overhead", dynamic=True)
+        print("  Compiling decoder layers...")
+        for i in range(len(model.decoder_layers)):
+            model.decoder_layers[i] = torch.compile(model.decoder_layers[i], mode="reduce-overhead", dynamic=True)
+            
+        print("  Compiling dependency transformer...")
+        model.dep_transformer = torch.compile(model.dep_transformer, mode="reduce-overhead", dynamic=True)
+        
+        print("  Compiling audio prenet...")
+        model.audio_prenet = torch.compile(model.audio_prenet, mode="reduce-overhead", dynamic=True)
+        
+        if hasattr(model, 'phonetic_planner'):
+            print("  Compiling phonetic planner...")
+            model.phonetic_planner.transformer = torch.compile(model.phonetic_planner.transformer, mode="reduce-overhead", dynamic=True)
+            model.phonetic_planner = torch.compile(model.phonetic_planner, mode="reduce-overhead", dynamic=True)
+            
         # Mimi is a standard CNN/Transformer, default compilation is usually best.
         mimi = torch.compile(mimi, dynamic=True)
         
@@ -311,7 +365,14 @@ def run_inference(args):
                 # 1. Minimal phonetic + acoustic warmup (triggers most kernels)
                 dummy_text = torch.zeros((1, 5), dtype=torch.long, device=device)
                 dummy_lens = torch.tensor([5], device=device)
-                _ = model.sample(dummy_text, dummy_lens, max_steps=4)
+                
+                if hasattr(model, 'phonetic_planner'):
+                    dummy_text_feat = torch.randn(1, 5, model.dim, device=device, dtype=dtype)
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                        _ = model.phonetic_planner.sample(dummy_text_feat, max_len=4)
+
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                    _ = model.sample(dummy_text, dummy_lens, max_steps=4)
                 
                 # 2. Mimi decode warmup
                 _ = mimi.decode(torch.zeros((1, 8, 4), dtype=torch.long, device=device))
@@ -323,18 +384,20 @@ def run_inference(args):
         metrics['compilation_time_s'] = comp_time
 
     # 2. Text processing
-    text = args.text
-    print(f"Input Text: '{text}'")
-    t_ids = torch.tensor([tokenizer.encode(text)], device=device)
+    from seedvox.utils.text import normalize_text
+    raw_text = args.text
+    text = normalize_text(raw_text)
+    print(f"Input Text (Raw): '{raw_text}'")
+    print(f"Input Text (Norm): '{text}'")
+    
+    t_ids = torch.tensor([tokenizer.encode(text, normalize=False)], device=device)
     t_lens = torch.tensor([t_ids.shape[1]], device=device)
     
     total_start = time.time()
     
     # 3. Phonetic Planning (CoT step 1)
     ph_start = time.time()
-    
-    dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16 if args.dtype == 'fp16' else torch.float32
-    autocast_enabled = args.dtype != 'fp32'
+
 
     bpe_ids, bpe_lens, char_to_bpe = None, None, None
     if args.overwrite_phonemes:
@@ -345,7 +408,8 @@ def run_inference(args):
     elif args.use_external_g2p:
         print(f"Using external G2P ({args.g2p}) for phonemes...")
         generator = PhoneticGenerator(backend=args.g2p, phoneme_vocab_size=model.EOS_ID)
-        ph_ids_list = generator.generate_targets(text)
+        # Note: text is already normalized
+        ph_ids_list = generator.generate_targets(text, normalize=False)
         ph_ids = torch.tensor([ph_ids_list], device=device)
         ph_tokenizer = PhonemeTokenizer()
         clean_tokens = [t for t in ph_ids_list if t != model.SOS_ID and t != model.EOS_ID]
@@ -391,8 +455,11 @@ def run_inference(args):
     elif args.random_speaker:
         print("Sampling random speaker...")
         num_spk = model.cfg.get('num_speaker_latents', 16)
-        ext_spk = torch.randn(1, num_spk, model.dim, device=device)
-
+        # Scale to match the trained latent distribution (std ~0.02)
+        ext_spk = torch.randn(1, num_spk, model.dim, device=device) #* 0.02
+    
+    print(ext_spk)
+     
     ext_prs = None
     if args.ref_wav_prosody:
         print(f"Extracting prosody from {args.ref_wav_prosody}...")
@@ -408,7 +475,7 @@ def run_inference(args):
         num_prs = model.cfg.get('num_prosody_tokens', 32)
         ext_prs = torch.randn(1, num_prs, model.dim, device=device)
     
-    # NEW: Explicit Context Encoding (Timing Prosody Planning)
+    # Explicit Context Encoding (Timing Prosody Planning)
     # This ensures jepa_planner is timed here, not hidden in generation.
     print("Encoding context and planning prosody...")
     with torch.no_grad():
@@ -510,6 +577,7 @@ if __name__ == "__main__":
     parser.add_argument("--text", type=str, required=True)
     parser.add_argument("--config", default="configs/default.json")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/seedvox_latest.pt")
+    parser.add_argument("--ph_checkpoint", type=str, default=None, help="Optional separate phonetic pre-train weights")
     parser.add_argument("--output", default="output.wav")
     parser.add_argument("--overwrite_phonemes", type=str, default=None)
     parser.add_argument("--use_external_g2p", action="store_true", help="Use external G2P instead of phonetic planner")
@@ -525,6 +593,7 @@ if __name__ == "__main__":
     parser.add_argument("--ref_wav_prosody", type=str, default=None)
     parser.add_argument("--random_speaker", action="store_true")
     parser.add_argument("--random_prosody", action="store_true")
+    parser.add_argument("--use_linguistic_fusion", action="store_true", help="Force use of FusionPlannerModel")
     
     # Phoneme sampling
     parser.add_argument("--phoneme_temp", type=float, default=1.0)

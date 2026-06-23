@@ -49,15 +49,18 @@ def collate_fn(batch):
     char_ids = torch.nn.utils.rnn.pad_sequence(char_ids_list, batch_first=True, padding_value=0)
     ph_targets = torch.nn.utils.rnn.pad_sequence(ph_targets_list, batch_first=True, padding_value=0)
     
-    # Calculate lenses (min of char and ph targets as in original script)
-    batch_size = len(batch)
-    char_lens = torch.zeros(batch_size, dtype=torch.long)
-    for i in range(batch_size):
-        char_lens[i] = min(len(char_ids_list[i]), len(ph_targets_list[i]))
-        # Also ensure we don't exceed the padded size
-        char_lens[i] = min(char_lens[i], char_ids.shape[1])
+    # Correct sequence lengths
+    char_lens = torch.tensor([len(c) for c in char_ids_list], dtype=torch.long)
+    ph_lens = torch.tensor([len(p) for p in ph_targets_list], dtype=torch.long)
+    
+    # Masks (True for valid tokens)
+    # text_feat length will be char_ids.shape[1] + 2 due to SOT/EOT wrapping
+    T_feat = char_ids.shape[1] + 2
+    text_mask = torch.arange(T_feat).unsqueeze(0) < (char_lens.unsqueeze(1) + 2)
+    
+    ph_mask = torch.arange(ph_targets.shape[1]).unsqueeze(0) < ph_lens.unsqueeze(1)
         
-    return char_ids, ph_targets, char_lens
+    return char_ids, ph_targets, char_lens, text_mask, ph_mask
 
 def pretrain_phonetic_head(config, device, max_steps=15000, lr=1e-4, batch_size=32, save_path='pretrained_models/phonetic_head_pretrain.pt', resume=False):
     """
@@ -73,7 +76,11 @@ def pretrain_phonetic_head(config, device, max_steps=15000, lr=1e-4, batch_size=
     # Optimize text-related parameters
     text_params = [p for n, p in model.named_parameters() if any(x in n for x in ['text_emb', 'text_encoder', 'phoneme_head', 'phonetic_planner', 'bpe_encoder', 'bpe_gate']) and p.requires_grad]
     optimizer = torch.optim.AdamW(text_params, lr=lr)
-    ph_criterion = nn.CrossEntropyLoss(ignore_index=0)
+    
+    # EOS weighting for ph_planner consistency
+    weights = torch.ones(129, device=device)
+    weights[128] = 5.0
+    ph_criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=0)
     
     # Mixed precision training
     scaler = torch.amp.GradScaler('cuda')
@@ -136,7 +143,7 @@ def pretrain_phonetic_head(config, device, max_steps=15000, lr=1e-4, batch_size=
     # Counter for samples in the dataloader
     batch_idx = 0
     try:
-        for char_ids, ph_targets, char_lens in dataloader:
+        for char_ids, ph_targets, char_lens, text_mask, ph_mask in dataloader:
             batch_idx += 1
             if batch_idx <= start_step:
                 if batch_idx % 100 == 0:
@@ -146,15 +153,17 @@ def pretrain_phonetic_head(config, device, max_steps=15000, lr=1e-4, batch_size=
             char_ids = char_ids.to(device)
             ph_targets = ph_targets.to(device)
             char_lens = char_lens.to(device)
+            text_mask = text_mask.to(device)
+            ph_mask = ph_mask.to(device)
             
             optimizer.zero_grad()
             
             with torch.amp.autocast('cuda'):
-                # Get enriched features
+                # Get enriched features (char_lens used for BPE wrapping internal logic)
                 text_feat = model.get_enriched_text_feat(char_ids, char_lens)
                 
-                # Forward pass: Phonetic Planner
-                ph_logits = model.phonetic_planner(text_feat, ph_targets)
+                # Forward pass: Phonetic Planner (passing text_mask and ph_mask)
+                ph_logits = model.phonetic_planner(text_feat, ph_targets, text_mask=text_mask, phoneme_mask=ph_mask)
                 
                 # Loss: Shift targets to match logits (predicts ph_targets[:, 1:])
                 shifted_targets = ph_targets[:, 1:]

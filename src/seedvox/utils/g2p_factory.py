@@ -1,6 +1,6 @@
 import abc
 from g2p_en import G2p
-from phonemizer import phonemize
+from phonemizer.backend import EspeakBackend
 from phonemizer.separator import Separator
 import re
 import math
@@ -16,7 +16,11 @@ class G2PEnGenerator(PhonemeGenerator):
         self.g2p = G2p()
 
     def __call__(self, text) -> list:
-        return self.g2p(text)
+        if isinstance(text, str):
+            return self.g2p(text)
+        # g2p_en's G2p object doesn't have a batch method, but we can loop
+        # Actually it's pretty fast, but let's be consistent
+        return [self.g2p(t) for t in text]
 
 class EspeakGenerator(PhonemeGenerator):
     IPA_TO_ARPABET = {
@@ -26,7 +30,8 @@ class EspeakGenerator(PhonemeGenerator):
         'dʒ': 'JH', 'k': 'K', 'l': 'L', 'm': 'M', 'n': 'N', 'ŋ': 'NG', 'oʊ': 'OW',
         'ɔɪ': 'OY', 'p': 'P', 'ɹ': 'R', 's': 'S', 'ʃ': 'SH', 't': 'T', 'θ': 'TH',
         'ʊ': 'UH', 'u': 'UW', 'uː': 'UW', 'v': 'V', 'w': 'W', 'j': 'Y', 'z': 'Z',
-        'ʒ': 'ZH', 'ə': 'AH', 'ᵻ': 'IH'
+        'ʒ': 'ZH', 'ə': 'AH', 'ᵻ': 'IH',
+        'ɐ': 'AH', 'ɜ': 'ER', 'a': 'AA', 'o': 'OW', 'e': 'EY', 'ɾ': 'T', 'ʔ': 'T'
     }
 
     VOWELS = {
@@ -35,27 +40,30 @@ class EspeakGenerator(PhonemeGenerator):
 
     def __init__(self, language='en-us'):
         self.language = language
+        self.backend = EspeakBackend(
+            language=language,
+            punctuation_marks=None,
+            preserve_punctuation=True,
+            with_stress=True
+        )
+        self.separator = Separator(phone=None, word=' ')
 
     def __call__(self, text) -> list:
         if isinstance(text, str):
             texts = [text]
+            is_single = True
         else:
             texts = text
+            is_single = False
             
-        phonemes_list = phonemize(
+        phonemes_list = self.backend.phonemize(
             texts, 
-            backend='espeak', 
-            language=self.language, 
-            strip=True, 
-            preserve_punctuation=True, 
-            with_stress=True,
-            separator=Separator(phone=None, word=' ')
+            separator=self.separator,
+            strip=True
         )
         
-        if isinstance(text, str):
-            return self._process_single_result(phonemes_list[0])
-        
-        return [self._process_single_result(p) for p in phonemes_list]
+        results = [self._process_single_result(p) for p in phonemes_list]
+        return results[0] if is_single else results
 
     def _process_single_result(self, phonemes_str):
         result = []
@@ -131,12 +139,25 @@ class DeepPhonemizerGenerator(PhonemeGenerator):
     def __call__(self, text) -> list:
         if isinstance(text, str):
             return self._process_single(text)
-        return [self._process_single(t) for t in text]
+        
+        # Batch processing for DeepPhonemizer
+        norm_texts = [self.normalize(t) for t in text]
+        # DeepPhonemizer's self.phonemizer might support batching if it's the right version
+        # But let's check if it returns a list if passed a list
+        try:
+            raw_outputs = self.phonemizer(norm_texts, lang='en_us')
+            if isinstance(raw_outputs, str): raw_outputs = [raw_outputs]
+            return [self._parse_raw_output(o) for o in raw_outputs]
+        except:
+            # Fallback to sequential if batching fails
+            return [self._process_single(t) for t in text]
 
     def _process_single(self, text):
         norm_text = self.normalize(text)
         raw_output = self.phonemizer(norm_text, lang='en_us')
-        
+        return self._parse_raw_output(raw_output)
+
+    def _parse_raw_output(self, raw_output):
         # Parse the output
         # Find all blocks like [PH] or spaces or punctuation
         tokens = re.findall(r'\[([^\]]+)\]|(\s+)|([^\s\[\]]+)', raw_output)

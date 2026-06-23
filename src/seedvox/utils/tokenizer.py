@@ -40,11 +40,16 @@ class PhonemeTokenizer:
             stressed_vowels.extend([v + '0', v + '1', v + '2'])
         self.special = [' ', '.', ',', '!', '?', '-', "'", '"', '(', ')', '<EPS>']
         self.vocab = self.phonemes + stressed_vowels + self.special
-        self.id_to_ph = {i + 4: ph for i, ph in enumerate(self.vocab)}
-        self.id_to_ph[self.eps_token_id] = "<EPS>"
         self.ph_to_id = {ph: i + 4 for i, ph in enumerate(self.vocab)}
         self.ph_to_id['<EPS>'] = self.eps_token_id
-        self.vocab_size = len(self.vocab) + 4
+        self.ph_to_id['<SOS>'] = self.eps_token_id
+        self.ph_to_id['<EOS>'] = 128
+        
+        self.id_to_ph = {i + 4: ph for i, ph in enumerate(self.vocab)}
+        self.id_to_ph[self.eps_token_id] = "<SOS>"
+        self.id_to_ph[128] = "<EOS>"
+        
+        self.vocab_size = 129 # Ensure vocab size covers EOS
     def encode(self, phoneme_string):
         tokens = []
         for ph in phoneme_string.split():
@@ -53,9 +58,13 @@ class PhonemeTokenizer:
     def decode(self, ids):
         res = []
         for i in ids:
-            if i >= 3: res.append(self.id_to_ph.get(i, "?"))
+            if isinstance(i, torch.Tensor): i = i.item()
+            if i in self.id_to_ph:
+                res.append(self.id_to_ph[i])
             elif i == 1: res.append("?")
             elif i == 2: res.append("[MASK]")
+            elif i == 0: continue # Skip padding in decode
+            else: res.append(f"<{i}>")
         return " ".join(res)
 
 class BPECharEncoder(nn.Module):

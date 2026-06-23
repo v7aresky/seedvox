@@ -31,6 +31,18 @@ class PhoneticGenerator:
         phonemes = self.g2p(norm_text)
         return self.generate_targets_from_phonemes(phonemes)
 
+    def generate_targets_batch(self, texts, normalize=True):
+        """
+        Generates a batch of phoneme ID sequences with SOS and EOS tokens.
+        Much more efficient for backends like espeak that support batching.
+        """
+        norm_texts = [normalize_text(t) if normalize else t for t in texts]
+        
+        # Batch G2P call
+        phonemes_list = self.g2p(norm_texts)
+        
+        return [self.generate_targets_from_phonemes(ph) for ph in phonemes_list]
+
     def generate_targets_from_phonemes(self, phonemes):
         """Converts pre-generated phonemes to IDs with SOS and EOS."""
         # Convert to IDs

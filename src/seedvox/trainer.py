@@ -59,6 +59,7 @@ class SeedVoxTrainer:
 
         # EMA initialization
         self.ema_decay = self.cfg['training'].get('ema_decay', 0.999)
+        self.jepa_n_q = config['model'].get('jepa_n_q', self.model.n_q//2)
         self.ema_model = copy.deepcopy(self.model)
         self.ema_model.eval()
         for p in self.ema_model.parameters():
@@ -174,12 +175,14 @@ class SeedVoxTrainer:
         T_max = t_ids.shape[1]
         
         # 1. Phoneme generation
+        use_precomputed = self.cfg['training'].get('use_precomputed_phonemes', True)
+        
         if self.use_explicit:
-            if ph_ids is not None:
+            if ph_ids is not None and use_precomputed:
                 ph_targets = ph_ids
             else:
                 # Use raw sequences with SOS/EOS (matching pretraining) - Fallback
-                raw_ph_ids = [self.ph_generator.generate_targets(text) for text in raw_texts]
+                raw_ph_ids = self.ph_generator.generate_targets_batch(raw_texts)
                 max_ph_len = max(len(ids) for ids in raw_ph_ids)
                 ph_targets = torch.zeros((B, max_ph_len), dtype=torch.long, device=self.device)
                 for i, ids in enumerate(raw_ph_ids):
@@ -199,7 +202,7 @@ class SeedVoxTrainer:
             
         # 2. Extract Mimi Latents (The "Teacher" for JEPA)
         with torch.no_grad():
-            mimi_latents = self.mimi.decode_latent(a_toks[:, :self.model.n_q//2])
+            mimi_latents = self.mimi.decode_latent(a_toks[:, :self.jepa_n_q])
             
         # 3. Model Forward
         logits, targets, ph_logits, jepa_loss, phonetic_loss = self.model(
@@ -211,10 +214,18 @@ class SeedVoxTrainer:
         
         # 4. Losses
         # Audio Loss (AR)
+        curriculum = self.cfg['training'].get('curriculum_n_q', {})
+        if curriculum.get('enabled', False):
+            start = curriculum.get('start_codebooks', 4)
+            ramp = curriculum.get('ramp_steps', 50000)
+            num_enabled = min(self.model.n_q, start + int(self.global_step * (self.model.n_q - start) / ramp))
+        else:
+            num_enabled = self.model.n_q
+
         loss_ar = 0
-        for k in range(self.model.n_q):
+        for k in range(num_enabled):
             loss_ar += self.criterion(logits[k].view(-1, logits.shape[-1]), targets[:, k].reshape(-1))
-        loss_ar /= self.model.n_q
+        loss_ar /= num_enabled
         
         # Phonetic Loss
         loss_ph = torch.tensor(0.0, device=self.device)

@@ -32,24 +32,34 @@ class PhoneticPlanner(nn.Module):
         """
         text_feat: [B, T_text, dim] - joint Char and BPE features
         phoneme_ids: [B, T_ph] - target phoneme tokens for training (includes SOS and EOS)
+        text_mask: [B, T_text] - True for valid tokens, False for padding
+        phoneme_mask: [B, T_ph] - True for valid tokens, False for padding
         """
         B, T_text, _ = text_feat.shape
         device = text_feat.device
         
         if phoneme_ids is not None:
             # Training mode: AR with teacher forcing
-            # We shift the phonemes: Input is ph[:, :-1], Target is ph[:, 1:]
             ph_in = phoneme_ids[:, :-1]
             ph_emb = self.phoneme_emb(ph_in)
             
             # Combine text and phoneme inputs
             x = torch.cat([text_feat, ph_emb], dim=1)
             
-            logits = self.head(self.norm(self.transformer(x)))
+            # Combine masks if provided
+            full_mask = None
+            if text_mask is not None and phoneme_mask is not None:
+                # phoneme_mask is for phoneme_ids (includes SOS/EOS)
+                # ph_in is phoneme_ids[:, :-1]
+                full_mask = torch.cat([text_mask, phoneme_mask[:, :-1]], dim=1)
+            elif text_mask is not None:
+                # Assume all phoneme inputs are valid if no phoneme_mask
+                ph_m = torch.ones((B, ph_in.shape[1]), device=device, dtype=torch.bool)
+                full_mask = torch.cat([text_mask, ph_m], dim=1)
+            
+            logits = self.head(self.norm(self.transformer(x, attn_mask=full_mask)))
             
             # Slice logits to match the targets (phoneme_ids[:, 1:])
-            # Index T_text predicts phoneme_ids[:, 1] (the first token after SOS)
-            # The indices T_text to the end correspond to targets p1, p2, ..., EOS
             ph_logits = logits[:, T_text:, :]
             return ph_logits
         else:
@@ -67,6 +77,7 @@ class PhoneticPlanner(nn.Module):
         
         with self.transformer.streaming(B):
             # 1. Process text features prefix (updates KV cache)
+            # Use text_mask if provided (should be True for valid tokens)
             _ = self.transformer(text_feat, attn_mask=text_mask)
             
             # 2. AR Sampling loop
@@ -86,9 +97,12 @@ class PhoneticPlanner(nn.Module):
                     sorted_indices_to_remove = cumulative_probs > top_p
                     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
-                    for b_idx in range(B):
-                        indices_to_remove = sorted_indices[b_idx][sorted_indices_to_remove[b_idx]]
-                        last_logits[b_idx, indices_to_remove] = -float('inf')
+                    
+                    # Vectorized removal of logits to avoid CPU-GPU syncs in AR loop
+                    mask_to_remove = torch.zeros_like(last_logits, dtype=torch.bool).scatter_(
+                        dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+                    )
+                    last_logits.masked_fill_(mask_to_remove, -float('inf'))
                     probs = F.softmax(last_logits, dim=-1)
 
                 next_tok = torch.multinomial(probs, 1)
@@ -99,4 +113,4 @@ class PhoneticPlanner(nn.Module):
                 if (next_tok == self.EOS_ID).all():
                     break
                     
-        return torch.cat(generated, dim=1)
+        return torch.cat([torch.full((B, 1), self.SOS_ID, device=device, dtype=torch.long)] + generated, dim=1)

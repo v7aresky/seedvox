@@ -215,9 +215,11 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
             current_prosody = pred_prosody
 
         # 5. Speaker Adaptation (FiLM)
+        # Bypassing SpeakerAdapter modulation for Prosody to unify with ExplicitPlannerModel's FiLMAdapter
         speaker_vector = spk.mean(dim=1, keepdim=True) if spk is not None else torch.zeros(B, 1, self.dim, device=device)
-        scale, shift = self.speaker_adapter(speaker_vector)
-        adapted_prosody = current_prosody * scale + shift
+        # scale, shift = self.speaker_adapter(speaker_vector)
+        # adapted_prosody = current_prosody * scale + shift
+        adapted_prosody = current_prosody
         
         # 6. Conditioning Dropout
         if drop_prob > 0 and self.training:
@@ -283,7 +285,8 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
     def sample(self, text, text_lens, ref_audio=None, ref_lens=None, max_steps=1000, temp=0.1, curr_n_q=None, raw_texts=None, top_k=0, top_p=0.9, use_speaker=None, use_prosody=None, cfg_scale=1.0,
                bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None, phoneme_ids=None, drop_prob=0.0,
                external_speaker=None, external_prosody=None,
-               precomputed_context=None, precomputed_mask=None):
+               precomputed_context=None, precomputed_mask=None,
+               offset=None):
         B, device = text.shape[0], text.device
         if curr_n_q is None: curr_n_q = self.n_q
         
@@ -302,11 +305,12 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
             )
         
         # Calculate text offset for CFG masking
-        offset = 0
-        if (use_speaker if use_speaker is not None else self.use_speaker):
-            offset += self.cfg['num_speaker_latents']
-        # JEPA prosody tokens are ALWAYS present in this model
-        offset += self.cfg.get('num_prosody_tokens', 32)
+        if offset is None:
+            offset = 0
+            if (use_speaker if use_speaker is not None else self.use_speaker):
+                offset += self.cfg['num_speaker_latents']
+            # JEPA prosody tokens are ALWAYS present in this model
+            offset += self.cfg.get('num_prosody_tokens', 32)
 
         if cfg_scale != 1.0:
             uncond_mask = ctx_mask.clone()
@@ -350,12 +354,16 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                 t_in_base = x
                 step_toks = []
                 prev_tok = None
-                with self.dep_transformer.streaming(B_eff):
+                
+                # Fix: Initialize streaming with the actual batch size of t_in_base (B)
+                current_batch_size = t_in_base.shape[0]
+                with self.dep_transformer.streaming(current_batch_size):
                     for k in range(self.n_q):
                         if k < curr_n_q:
                             dep_input = self.dep_in[k](t_in_base) if k == 0 or prev_tok is None else self.dep_in[k](t_in_base) + self.dep_emb[k-1](prev_tok)
                             l = self.dep_layers[k](self.dep_transformer(dep_input)) / max(temp, 1e-6)
-                            l = l.view(B_eff, -1)
+                            # Use the model's card + 3 as the vocabulary size for the view
+                            l = l.view(current_batch_size, self.card + 3)
                             if k > 0: l[:, self.SOA_ID:self.EOA_ID+1] = -float('inf')
                             if top_k > 0:
                                 v, _ = torch.topk(l, min(top_k, l.size(-1)))
@@ -366,14 +374,14 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                                 sorted_indices_to_remove = cumulative_probs > top_p
                                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                                 sorted_indices_to_remove[..., 0] = 0
-                                for b_idx in range(B_eff):
+                                for b_idx in range(current_batch_size):
                                     indices_to_remove = sorted_indices[b_idx][sorted_indices_to_remove[b_idx]]
                                     l[b_idx, indices_to_remove] = -float('inf')
                             next_tok = torch.multinomial(F.softmax(l, dim=-1), 1)
                             step_toks.append(next_tok)
                             prev_tok = next_tok
                         else:
-                            step_toks.append(torch.zeros((B_eff, 1), device=device, dtype=torch.long))
+                            step_toks.append(torch.zeros((current_batch_size, 1), device=device, dtype=torch.long))
                 
                 curr_step_toks = torch.stack(step_toks, 1)
                 if curr_step_toks[0, 0, 0] == self.EOA_ID: break

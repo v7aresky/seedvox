@@ -13,6 +13,7 @@
     "text_encoder_layers": 6,
     "jepa_layers": 4,
     "jepa_heads": 8,
+    "jepa_n_q": 8,
     "depformer_num_layers": 6,
     "num_codebooks": 16,
     "use_pre_norm": true,
@@ -22,6 +23,7 @@
     "use_jepa_planner": true,
     "use_phonetic": true,
     "use_explicit_planner": true,
+    "use_film": true,
     "bpe_encoder": {
       "enabled": true,
       "bpe_layers": 2,
@@ -33,29 +35,37 @@
   "training": {
     "batch_size": 12,
     "num_workers": 8,
-    "lr": 1e-4,
+    "lr": 1e-5,
     "ph_pretrain_path": "pretrained_models/phonetic_head_pretrain.pt",
     "param_groups": [
       {
         "keywords": ["text_emb", "text_encoder"],
-        "lr": 1e-6
+        "lr": 1e-5
       },
       {
         "keywords": ["phonetic_planner","ph_decoder_emb", "film_phn", "film_prs"],
-        "lr": 1e-6
+        "lr": 1e-5
       }
     ],
     "warmup_steps": 2000,
-
     "epochs": 100,
     "train_tokens_path": [
-      "../autovoc/dataset/train_tokens_hifi_24q.pt"
+      "../autovoc/dataset/hifitts/train_tokens_hifitts.pt",
+      "../autovoc/dataset/train_tokens_prosody_16q.pt",
+      "../autovoc/dataset/train_tokens_libri_prosody_16q.pt",
+      "../autovoc/dataset/train_tokens_prosody_zp.pt"
     ],
     "output_prefix": "seedvox_",
-    "jepa_weight": 0.5,
-    "ph_weight": 0.6,
+    "jepa_weight": 0.1,
+    "ph_weight": 0.1,
     "dur_weight": 0.08,
     "val_ratio": 0.02,
-    "ema_decay": 0.999
+    "ema_decay": 0.999,
+    "use_precomputed_phonemes": false,
+    "curriculum_n_q": {
+      "enabled": true,
+      "start_codebooks": 4,
+      "ramp_steps": 50000
+    }
   }
 }

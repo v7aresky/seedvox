@@ -136,7 +136,14 @@ class PhoneticAligner:
         norm_text = normalize_text(text) if normalize else text
         
         # 1. Global G2P call for context
+        # Ensure we call with a string if it's a single text, 
+        # but our generators now handle both.
         full_phonemes = self.g2p(norm_text)
+        
+        if not isinstance(full_phonemes, list) or (len(full_phonemes) > 0 and isinstance(full_phonemes[0], list)):
+             # If it returned a batch, take the first one
+             full_phonemes = full_phonemes[0]
+
         return self.align_phonemes_to_text(norm_text, full_phonemes)
 
 def collapse_duplicates(ids):
