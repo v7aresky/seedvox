@@ -18,6 +18,7 @@ sys.path.insert(0, str(root_dir / "src"))
 
 from explicit_pros_phon_planner.model import ExplicitPlannerModel
 from explicit_pros_phon_planner.model_fusion import FusionPlannerModel
+from explicit_pros_phon_planner.finetune_lora_fusion import inject_lora, LoRALinear, LoRAConv1d, LoRAConvTranspose1d
 
 from seedvox.utils.tokenizer import CharTokenizer, PhonemeTokenizer
 from explicit_pros_phon_planner.utils import PhoneticGenerator, collate_phonemes
@@ -222,6 +223,93 @@ def set_seed(seed):
         # torch.backends.cudnn.deterministic = True
         # torch.backends.cudnn.benchmark = False
 
+def merge_lora_weights(model_with_lora):
+    """
+    Permanently merge LoRA weights into a clean model.
+    Returns a new model with merged weights and no LoRA wrappers.
+    Handles LoRALinear (weight-merged), LoRAConv1d, LoRAConvTranspose1d.
+    """
+    model_cls = type(model_with_lora)
+    cfg = model_with_lora.cfg
+    tokenizer = CharTokenizer()
+    clean_model = model_cls(cfg, tokenizer.vocab_size, phoneme_vocab_size=128).to(
+        next(model_with_lora.parameters()).device
+    )
+    clean_sd = clean_model.state_dict()
+    loaded_sd = model_with_lora.state_dict()
+
+    lora_linear = {}
+    lora_conv1d = {}
+    lora_convtr1d = {}
+    for name, mod in model_with_lora.named_modules():
+        if isinstance(mod, LoRALinear):
+            lora_linear[name] = mod
+        elif isinstance(mod, LoRAConv1d):
+            lora_conv1d[name] = mod
+        elif isinstance(mod, LoRAConvTranspose1d):
+            lora_convtr1d[name] = mod
+
+    merged_sd = {}
+    for key in clean_sd:
+        parts = key.rsplit('.', 1)
+        mod_path = parts[0] if len(parts) == 2 else ''
+        param_name = parts[-1] if len(parts) == 2 else parts[0]
+
+        if mod_path in lora_linear:
+            mod = lora_linear[mod_path]
+            if param_name == 'weight':
+                merged_sd[key] = mod.weight.detach().cpu()
+            elif param_name == 'bias':
+                merged_sd[key] = mod.bias.detach().cpu() if mod.bias is not None else clean_sd[key]
+            else:
+                merged_sd[key] = clean_sd[key]
+
+        elif mod_path in lora_conv1d:
+            mod = lora_conv1d[mod_path]
+            if param_name == 'weight':
+                merged = mod.original_conv.weight + (mod.lora_B @ mod.lora_A) * mod.scaling
+                merged_sd[key] = merged.detach().cpu()
+            elif param_name == 'bias':
+                merged_sd[key] = mod.bias.detach().cpu() if mod.bias is not None else clean_sd[key]
+            else:
+                merged_sd[key] = clean_sd[key]
+
+        elif mod_path in lora_convtr1d:
+            mod = lora_convtr1d[mod_path]
+            if param_name == 'weight':
+                out_c, in_c_g = mod.original_convtr.weight.shape[:2]
+                g = mod.original_convtr.groups
+                lo = (mod.lora_B @ mod.lora_A.transpose(1, 2)).transpose(0, 1).contiguous()
+                merged = mod.original_convtr.weight + lo.view_as(mod.original_convtr.weight) * mod.scaling
+                merged_sd[key] = merged.detach().cpu()
+            elif param_name == 'bias':
+                merged_sd[key] = mod.bias.detach().cpu() if mod.bias is not None else clean_sd[key]
+            else:
+                merged_sd[key] = clean_sd[key]
+
+
+        else:
+            if key in loaded_sd:
+                merged_sd[key] = loaded_sd[key].detach().cpu()
+            else:
+                merged_sd[key] = clean_sd[key]
+
+    clean_model.load_state_dict(merged_sd, strict=False)
+    return clean_model
+
+
+def load_lora_and_merge(model, lora_checkpoint, rank=16, alpha=32, device='cpu'):
+    """
+    Inject LoRA into a loaded model, load LoRA weights, then merge them in.
+    Returns a model with LoRA weights permanently merged (no LoRA wrappers).
+    """
+    model = inject_lora(model, rank=rank, alpha=alpha)
+    lora_sd = torch.load(lora_checkpoint, map_location=device)
+    model.load_state_dict(lora_sd, strict=False)
+    merged_model = merge_lora_weights(model)
+    return merged_model
+
+
 def run_inference(args):
     if args.seed is not None:
         set_seed(args.seed)
@@ -283,13 +371,28 @@ def run_inference(args):
             print("@@@@ Loading standard model weights (from full checkpoint)...")
             state_dict = ckpt['model']
         else:
-            # Check filename for 'ema' to give a better message
             if 'ema' in args.checkpoint.lower():
                 print(f"@@@@@ Loading EMA model weights from {args.checkpoint}...")
             else:
                 print(f"@@@@ Loading model weights from {args.checkpoint}...")
             state_dict = ckpt
         model.load_state_dict(state_dict, strict=False)
+
+    # 1b. LoRA injection (if provided)
+    if args.lora_checkpoint:
+        print(f"\033[93m[LoRA]\033[0m Loading LoRA adapter from {args.lora_checkpoint}...")
+        raw_lora = torch.load(args.lora_checkpoint, map_location=device)
+        lora_sd = raw_lora.get('lora_state_dict', raw_lora)
+        # Infer rank from the first lora_A tensor shape
+        first_a = next(v for k, v in lora_sd.items() if 'lora_A' in k)
+        inferred_rank = first_a.shape[0]
+        inferred_alpha = raw_lora.get('lora_alpha', inferred_rank * 2)
+        lora_rank = args.lora_rank if args.lora_rank is not None else inferred_rank
+        lora_alpha = args.lora_alpha if args.lora_alpha is not None else inferred_alpha
+        print(f"\033[93m[LoRA]\033[0m Detected rank={inferred_rank}, alpha={inferred_alpha} from checkpoint (using rank={lora_rank}, alpha={lora_alpha})")
+        model = inject_lora(model, rank=lora_rank, alpha=lora_alpha)
+        model.load_state_dict(lora_sd, strict=False)
+        print(f"\033[92m[LoRA]\033[0m LoRA weights applied successfully.")
 
     if args.ph_checkpoint:
         print(f"@@@@@ Overloading phonetic weights from {args.ph_checkpoint}...")
@@ -374,8 +477,8 @@ def run_inference(args):
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
                     _ = model.sample(dummy_text, dummy_lens, max_steps=4)
                 
-                # 2. Mimi decode warmup
-                _ = mimi.decode(torch.zeros((1, 8, 4), dtype=torch.long, device=device))
+                # 2. Mimi decode warmup (match model's n_q)
+                _ = mimi.decode(torch.zeros((1, model.n_q, 4), dtype=torch.long, device=device))
             except Exception as e:
                 print(f"\033[91m  Warmup notification: {e}\033[0m")
         
@@ -439,125 +542,175 @@ def run_inference(args):
     if device.type == 'cuda': torch.cuda.synchronize()
     metrics['phonetic_planning_ms'] = (time.time() - ph_start) * 1000
 
-    # 4. Speaker and Prosody Conditioning
-    cond_start = time.time()
-    
-    ext_spk = None
-    if args.ref_wav_speaker:
-        print(f"Extracting speaker from {args.ref_wav_speaker}...")
-        wav = load_audio(args.ref_wav_speaker, device)
+    # 4. Variant generation loop
+    output_base = os.path.splitext(args.output)[0]
+    output_ext = os.path.splitext(args.output)[1] or '.wav'
+
+    cached_ext_spk = None
+    cached_ext_prs = None
+
+    for variant_idx in range(args.variant_n):
+        if args.variant_n > 1:
+            print(f"\n{'='*40}")
+            print(f"  Variant {variant_idx + 1} / {args.variant_n}")
+            print(f"{'='*40}")
+            if args.seed is not None:
+                set_seed(args.seed + variant_idx)
+
+        cond_start = time.time()
+
+        ext_spk = None
+        if args.ref_wav_speaker:
+            if cached_ext_spk is None:
+                print(f"Extracting speaker from {args.ref_wav_speaker}...")
+                wav = load_audio(args.ref_wav_speaker, device)
+                with torch.no_grad():
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                        mimi_toks = mimi.encode(wav.unsqueeze(0))
+                        ae = _sum_embeddings(model.audio_embs, mimi_toks, model.n_q)
+                        ae = model.audio_prenet(model.audio_norm(ae))
+                        cached_ext_spk = model.speaker_encoder(ae)
+            ext_spk = cached_ext_spk
+        elif args.random_speaker:
+            print("Sampling random speaker...")
+            num_spk = model.cfg.get('num_speaker_latents', 16)
+            ext_spk = torch.randn(1, num_spk, model.dim, device=device)
+
+        ext_prs = None
+        if args.ref_wav_prosody:
+            if cached_ext_prs is None:
+                print(f"Extracting prosody from {args.ref_wav_prosody}...")
+                wav = load_audio(args.ref_wav_prosody, device)
+                with torch.no_grad():
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                        mimi_toks = mimi.encode(wav.unsqueeze(0))
+                        ae = _sum_embeddings(model.audio_embs, mimi_toks, model.n_q)
+                        ae = model.audio_prenet(model.audio_norm(ae))
+                        cached_ext_prs = model.prosody_encoder(ae)
+            ext_prs = cached_ext_prs
+        elif args.random_prosody:
+            print("Sampling random prosody...")
+            num_prs = model.cfg.get('num_prosody_tokens', 32)
+            ext_prs = torch.randn(1, num_prs, model.dim, device=device)
+
+        # Auto-generate random embeddings for the varied axis if not already set
+        if args.variant_axis == 'speaker' and ext_spk is None:
+            print("Sampling random speaker (variant axis)...")
+            num_spk = model.cfg.get('num_speaker_latents', 16)
+            ext_spk = torch.randn(1, num_spk, model.dim, device=device)
+        if args.variant_axis == 'pros' and ext_prs is None:
+            print("Sampling random prosody (variant axis)...")
+            num_prs = model.cfg.get('num_prosody_tokens', 32)
+            ext_prs = torch.randn(1, num_prs, model.dim, device=device)
+
+        # Explicit Context Encoding (Timing Prosody Planning)
+        print("Encoding context and planning prosody...")
         with torch.no_grad():
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                mimi_toks = mimi.encode(wav.unsqueeze(0))
-                ae = _sum_embeddings(model.audio_embs, mimi_toks, model.n_q)
-                ae = model.audio_prenet(model.audio_norm(ae))
-                ext_spk = model.speaker_encoder(ae)
-    elif args.random_speaker:
-        print("Sampling random speaker...")
-        num_spk = model.cfg.get('num_speaker_latents', 16)
-        # Scale to match the trained latent distribution (std ~0.02)
-        ext_spk = torch.randn(1, num_spk, model.dim, device=device) #* 0.02
-    
-    print(ext_spk)
-     
-    ext_prs = None
-    if args.ref_wav_prosody:
-        print(f"Extracting prosody from {args.ref_wav_prosody}...")
-        wav = load_audio(args.ref_wav_prosody, device)
+                context, ctx_mask, _, _, _ = model.encode_context(
+                    t_ids, t_lens, raw_texts=[text], 
+                    phoneme_ids=ph_ids,
+                    bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
+                    external_speaker=ext_spk,
+                    external_prosody=ext_prs
+                )
+
+        if device.type == 'cuda': torch.cuda.synchronize()
+        cond_time = (time.time() - cond_start) * 1000
+        metrics['conditioning_total_ms'] = cond_time
+        metrics['prosody_planning_ms'] = cond_time
+
+        # 5. Acoustic Generation (CoT step 2)
+        ac_start = time.time()
+
         with torch.no_grad():
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                mimi_toks = mimi.encode(wav.unsqueeze(0))
-                ae = _sum_embeddings(model.audio_embs, mimi_toks, model.n_q)
-                ae = model.audio_prenet(model.audio_norm(ae))
-                ext_prs = model.prosody_encoder(ae)
-    elif args.random_prosody:
-        print("Sampling random prosody...")
-        num_prs = model.cfg.get('num_prosody_tokens', 32)
-        ext_prs = torch.randn(1, num_prs, model.dim, device=device)
-    
-    # Explicit Context Encoding (Timing Prosody Planning)
-    # This ensures jepa_planner is timed here, not hidden in generation.
-    print("Encoding context and planning prosody...")
-    with torch.no_grad():
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-            context, ctx_mask, _, _, _ = model.encode_context(
-                t_ids, t_lens, raw_texts=[text], 
-                phoneme_ids=ph_ids,
-                bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
-                external_speaker=ext_spk,
-                external_prosody=ext_prs
-            )
-            
-    if device.type == 'cuda': torch.cuda.synchronize()
-    cond_end = time.time()
-    metrics['conditioning_total_ms'] = (cond_end - cond_start) * 1000
-    # Prosody planning is effectively the entire context assembly here
-    metrics['prosody_planning_ms'] = metrics['conditioning_total_ms']
+                audio_tokens, _ = model.sample(
+                    t_ids, t_lens, 
+                    phoneme_ids=ph_ids,
+                    temp=args.temp,
+                    cfg_scale=args.cfg,
+                    bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
+                    external_speaker=ext_spk,
+                    external_prosody=ext_prs,
+                    precomputed_context=context,
+                    precomputed_mask=ctx_mask
+                )
+            if device.type == 'cuda': torch.cuda.synchronize()
+            metrics['acoustic_gen_ms'] = (time.time() - ac_start) * 1000
 
-    # 5. Acoustic Generation (CoT step 2)
-    ac_start = time.time()
-    
-    with torch.no_grad():
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-            # We now pass the precomputed context to avoid redundant work
-            # (Note: model.sample will need to be updated to support this, 
-            # or it will just recompute it, which is fine for metrics accuracy)
-            audio_tokens, _ = model.sample(
-                t_ids, t_lens, 
-                phoneme_ids=ph_ids,
-                temp=args.temp,
-                cfg_scale=args.cfg,
-                bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
-                external_speaker=ext_spk,
-                external_prosody=ext_prs,
-                precomputed_context=context,
-                precomputed_mask=ctx_mask
-            )
-        if device.type == 'cuda': torch.cuda.synchronize()
-        metrics['acoustic_gen_ms'] = (time.time() - ac_start) * 1000
-        
-        # Extract prosody embeddings for visualization separately if needed
-        # (This avoids polluting the main sample timing)
-        print("Extracting prosody embeddings for viz...")
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-            context, _, _, _, _ = model.encode_context(
-                t_ids, t_lens, audio_tokens, None, [text], 
-                phoneme_ids=ph_ids,
-                bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
-                external_speaker=ext_spk,
-                external_prosody=ext_prs
-            )
-        
-        spk_len = model.cfg['num_speaker_latents'] if model.use_speaker else 0
-        prs_len = model.cfg.get('num_prosody_tokens', 32)
-        prosody_embs = context[:, spk_len : spk_len + prs_len, :]
-        torch.save(prosody_embs.cpu(), "prosody_embs.pt")
-    
-    # 6. Decode with Mimi
-    dec_start = time.time()
-    with torch.no_grad():
-        wav = mimi.decode(audio_tokens)
-        if device.type == 'cuda': torch.cuda.synchronize()
-    metrics['mimi_decode_ms'] = (time.time() - dec_start) * 1000
-    
-    total_time = time.time() - total_start
-    audio_duration = wav.shape[2] / 24000
-    rtf = total_time / audio_duration if audio_duration > 0 else 0
-    
-    torchaudio.save(args.output, wav[0].cpu(), 24000)
-    print(f"Saved generated audio to {args.output}")
+            if args.variant_n <= 1:
+                print("Extracting prosody embeddings for viz...")
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                    context, _, _, _, _ = model.encode_context(
+                        t_ids, t_lens, audio_tokens, None, [text], 
+                        phoneme_ids=ph_ids,
+                        bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
+                        external_speaker=ext_spk,
+                        external_prosody=ext_prs
+                    )
 
-    if args.log_metrics:
+                spk_len = model.cfg['num_speaker_latents'] if model.use_speaker else 0
+                prs_len = model.cfg.get('num_prosody_tokens', 32)
+                prosody_embs = context[:, spk_len : spk_len + prs_len, :]
+                torch.save(prosody_embs.cpu(), "prosody_embs.pt")
+
+        # 6. Decode with Mimi
+        dec_start = time.time()
+        with torch.no_grad():
+            wav = mimi.decode(audio_tokens.clamp(0, model.card - 1))
+            # Trim to expected length: T frames at 12.5Hz → T * 24000/12.5 = T*1920 samples
+            expected_len = audio_tokens.shape[-1] * 1920
+            if wav.shape[-1] > expected_len:
+                wav = wav[..., :expected_len]
+            # Fade-in to mask causal convolution startup transient
+            fade_len = min(240, wav.shape[-1] // 4)  # 10ms at 24kHz
+            fade = torch.linspace(0.0, 1.0, fade_len, device=wav.device, dtype=wav.dtype)
+            wav[..., :fade_len] *= fade
+            wav[..., :fade_len] *= 0.90
+            if device.type == 'cuda': torch.cuda.synchronize()
+        metrics['mimi_decode_ms'] = (time.time() - dec_start) * 1000
+
+        # 7. Save output
+        if args.variant_n > 1:
+            variant_output = f"{output_base}_{variant_idx}{output_ext}"
+        else:
+            variant_output = args.output
+
+        torchaudio.save(variant_output, wav[0].cpu(), 24000)
+        print(f"Saved generated audio to {variant_output}")
+
+        if args.variant_n > 1 and args.log_metrics:
+            ph_ms = metrics.get('phonetic_planning_ms', 0)
+            print(f"  Variant {variant_idx + 1} | Conditioning: {cond_time:.1f}ms | "
+                  f"Acoustic: {metrics['acoustic_gen_ms']:.1f}ms | "
+                  f"Decode: {metrics['mimi_decode_ms']:.1f}ms")
+
+        if args.view_waveform:
+            print_waveform(wav[0])
+
+        if args.play:
+            play_audio_v5(wav[0])
+
+    # 8. Save merged checkpoint (LoRA weights baked into model)
+    if args.save_merged_checkpoint and args.lora_checkpoint:
+        print(f"\033[93m[Merge]\033[0m Merging LoRA weights into full model...")
+        merged_model = merge_lora_weights(model)
+        torch.save(merged_model.state_dict(), args.save_merged_checkpoint)
+        print(f"\033[92m[Merge]\033[0m Saved merged model to {args.save_merged_checkpoint}")
+
+    if args.variant_n <= 1 and args.log_metrics:
+        total_time = time.time() - total_start
+        audio_duration = wav.shape[2] / 24000
+        rtf = total_time / audio_duration if audio_duration > 0 else 0
+
         print("\n" + "="*30)
         print("Performance Metrics:")
         if 'compilation_time_s' in metrics:
             print(f"  Compilation Time:  {metrics['compilation_time_s']:.2f}s")
-        
-        # Combined Planner Metrics
         ph_ms = metrics.get('phonetic_planning_ms', 0)
         pr_ms = metrics.get('prosody_planning_ms', 0)
         print(f"  Planner:           Phonetics {ph_ms:.1f}ms; Prosody {pr_ms:.1f}ms")
-        
         print(f"  Acoustic Gen:      {metrics['acoustic_gen_ms']:.1f}ms")
         print(f"  Mimi Decode:       {metrics['mimi_decode_ms']:.1f}ms")
         print("-" * 30)
@@ -565,12 +718,6 @@ def run_inference(args):
         print(f"  Audio Duration:    {audio_duration:.2f}s")
         print(f"  Real-time Factor:  {rtf:.4f}x")
         print("="*30 + "\n")
-
-    if args.view_waveform:
-        print_waveform(wav[0])
-    
-    if args.play:
-        play_audio_v5(wav[0])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -605,6 +752,18 @@ if __name__ == "__main__":
     parser.add_argument("--log_metrics", action="store_true", help="Log performance metrics (latency, RTF)")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile for faster inference")
     
+    # Variant generation options
+    parser.add_argument("--variant_n", type=int, default=1, help="Number of variants to generate")
+    parser.add_argument("--variant_axis", choices=['pros', 'speaker'], default='pros',
+                        help="Axis to vary: 'pros' (different prosody, same speaker) or 'speaker' (different speakers, same prosody)")
+
+    # LoRA adapter options
+    parser.add_argument("--lora_checkpoint", type=str, default=None, help="LoRA adapter weights to apply on top of base checkpoint")
+    parser.add_argument("--lora_rank", type=int, default=None, help="LoRA rank (auto-detected from checkpoint if not set)")
+    parser.add_argument("--lora_alpha", type=int, default=None, help="LoRA alpha (auto-detected from checkpoint if not set)")
+    parser.add_argument("--save_merged_checkpoint", type=str, default=None,
+                        help="Save a full model checkpoint with LoRA weights permanently merged (requires --lora_checkpoint)")
+
     args = parser.parse_args()
     run_inference(args)
 

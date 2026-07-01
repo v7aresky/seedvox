@@ -10,7 +10,7 @@ class JEPAProsodyPlanner(nn.Module):
             d_model=dim, nhead=num_heads, dim_feedforward=int(dim * hidden_scale),
             dropout=0.1, activation='gelu', batch_first=True, norm_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
         self.head = nn.Sequential(nn.Linear(dim, dim), nn.LayerNorm(dim), nn.GELU(), nn.Linear(dim, dim))
     def forward(self, text_feat, text_mask=None):
         B = text_feat.shape[0]
