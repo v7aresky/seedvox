@@ -21,35 +21,55 @@ python -m explicit_pros_phon_planner.infer \
 - **Optimized Inference**: Supports `torch.compile` with persistent caching (`--compile`).
 - **High-Resolution Visualization**: Built-in terminal-based waveform renderer.
 
-## Conditioning Flow
+## Architecture
 
-The model uses a multi-modal conditioning strategy for acoustic token generation, combining semantic text features with explicit phonetic planning and speaker/prosody latents, followed by audio synthesis.
+The model follows a **fusion-based** architecture: text and phoneme features are fused via cross-attention before being passed to the acoustic decoder, avoiding the tri-alignment problem of separate modality blocks.
 
 ```mermaid
 graph TD
+    %% Inputs
+    Text["Input Text"]
+    Audio["Reference Audio"]
 
-    Text[Input Text] -->|BPE/Char Encoder| TE[Enriched Text Features]
-    TE -->|Transformer Phonetic Planner| PH[Phoneme IDs]
-    TE -->|JEPA Prosody Planner| PRS[Prosody Embeddings]
+    %% Text Encoding
+    Text -->|Char Tokenizer| CT["Char IDs"]
+    Text -->|BPE Tokenizer| BT["BPE IDs"]
+    CT -->|"Text Encoder"| TE["Text Features<br/>(B, T_text, dim)"]
+    BT -->|"BPE Encoder + Expand"| BE["BPE Features<br/>(B, T_text, dim)"]
+    BE -->|"Gated Add"| TE
 
-    %% Phoneme Flow
-    PH -->|Embedding| PE[Phoneme Embeddings]
-    PE & Speaker -->|FiLM Adapter| FPH[Modulated Phoneme Embeddings]
+    %% Audio Encoding
+    Audio -->|"Mimi Encoder"| AT["Audio Tokens<br/>(B, 16, T_audio)"]
+    AT -->|"Speaker Encoder"| SPK["Speaker Latents<br/>(B, 16, dim)"]
+    AT -->|"Prosody Encoder"| PRS["Prosody Embeddings<br/>(B, 32, dim)"]
 
-    
+    %% JEPA Prosody Planner
+    TE -->|"JEPA Prosody Planner"| JPRS["Predicted Prosody<br/>(B, 32, dim)"]
 
+    %% Phonetic Planner (AR)
+    TE -->|"Phonetic Planner"| PH["Phoneme IDs<br/>(B, T_ph)"]
+    PH -->|"Embed + Project"| PHE["Phoneme Features<br/>(B, T_ph, dim)"]
 
-    %% Prosody Flow
-    PRS & Speaker -->|FiLM Adapter| FPRS[Modulated Prosody Embeddings]
+    %% FiLM (Speaker Conditioning)
+    SPK -->|"Mean"| SL["Speaker Vector<br/>(B, dim)"]
+    SL -->|"FiLM Phn"| FPH["Modulated Phoneme<br/>(B, T_ph, dim)"]
+    SL -->|"FiLM Prs"| FPRS["Modulated Prosody<br/>(B, 32, dim)"]
+    PHE --> FPH
+    JPRS --> FPRS
 
-    %% Context Construction
-    TE --> C([Augmented Context])
-    FPH --> C
-    FPRS --> C
-    Speaker --> C
+    %% Linguistic Fusion (Key Innovation)
+    TE --> LF["LinguisticFusion<br/>(Cross-Attention)"]
+    FPH --> LF
+    LF -->|"Gated Residual"| UT["Unified Text<br/>(B, T_text, dim)"]
 
-    C -->|Transformer Acoustic Decoder| Acoustic[Acoustic Tokens]
-    Acoustic -->|Mimi Decoder| Audio_Out[Audio Waveform]
+    %% Context Assembly
+    SPK --> CTX["Augmented Context"]
+    FPRS --> CTX
+    UT --> CTX
+
+    CTX -->|"Acoustic Decoder"| TOK["Acoustic Tokens<br/>(B, 16, T_audio)"]
+    TOK -->|"Depformer"| RVQ["RVQ Tokens<br/>(B, 16, T_audio)"]
+    RVQ -->|"Mimi Decoder"| WAV["Audio Waveform"]
 ```
 
 ## License
