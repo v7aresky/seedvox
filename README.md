@@ -82,12 +82,22 @@ graph TD
 
 ```bash
 python -m explicit_pros_phon_planner.infer \
-    --text "Your text here" \
-    --checkpoint ./checkpoints/seedvox_latest_slim_bf16.pt \
-    --dtype bf16 \
-    --play \
-    --log_metrics \
-    --device cuda
+    --config ./configs/light_fusion_r3.json \
+    --checkpoint ./checkpoints/seedvox_light_fusion_epoch_55.pt \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --output output.wav
+```
+
+**Example output:**
+```
+Input Text (Raw): 'The quick brown fox jumps over the lazy dog.'
+Input Text (Norm): 'the quick brown fox jumps over the lazy dog.'
+BPE Tokens: 'the quick brown fox jumps over the lazy dog.'
+Planned Phonemes: DH AH0   K W IH1 K   B R AW1 N   F AA1 K S   JH AH1 M P S   OW2 V ER0   DH AH0   L EY1 Z IY0   D AA1 G .
+Sampling random prosody (variant axis)...
+Encoding context and planning prosody...
+Extracting prosody embeddings for viz...
+Saved generated audio to output.wav
 ```
 
 ### 🚀 Features
