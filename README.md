@@ -2,7 +2,7 @@
 
 Great AI speech shouldn't just be built bigger. It should be built smarter.
 
-SeedVox is a hybrid speech synthesis engine that brings structural discipline back to neural audio. Instead of forcing a single model to juggle pronunciation, rhythm, and emotion at once, it splits the workload using a **JEPA World Model** for global prosody planning alongside dedicated autoregressive components for phonetic and acoustic generation — a more elegant, frugal, and mathematically sound approach.
+SeedVox is a hybrid speech synthesis engine that brings structural discipline back to neural audio. Instead of forcing a single model to juggle pronunciation, rhythm, and emotion at once, it splits the workload into three specialized components: an **AR Phonetic Planner** for phoneme prediction, a **JEPA World Model** for global prosody planning, and an **AR Acoustic Decoder** for audio token generation — a more elegant, frugal, and mathematically sound approach.
 
 ---
 
