@@ -1,18 +1,17 @@
 # 🌱 SeedVox
 
-Great AI speech shouldn't just be built bigger. It should be built smarter — and it should be open for everyone to learn from.
-
-SeedVox is a hybrid speech synthesis engine that brings structural discipline back to neural audio, designed as an educational and research sandbox for understanding how machines learn to speak. Instead of forcing a single model to juggle pronunciation, rhythm, and emotion at once, it splits the workload into three specialized components: an **AR Phonetic Planner** for phoneme prediction, a **JEPA World Model** for global prosody planning, and an **AR Acoustic Decoder** for audio token generation. This structured approach trains smarter models that require less hardware and data, making speech generation research accessible on consumer GPUs — a more elegant, frugal, and mathematically sound path to exploring how systems learn to speak.
+Great AI speech shouldn't just be built bigger. It should also be built smarter — and it should be open for everyone to learn from.
+SeedVox is a speech synthesis solution that brings structural discipline back to neural audio, designed as an educational and research sandbox for understanding how machines learn to speak. Instead of forcing a single model to juggle pronunciation, rhythm, and emotion at once, it splits the workload into three specialized components: an **AR Phonetic Planner** for phoneme prediction, a **JEPA World Model** for global prosody planning, and an **AR Acoustic Decoder** for audio token generation. This structured approach trains smarter models that require less hardware and data, making speech generation research accessible on consumer GPUs — a more elegant, frugal, and mathematically sound path to exploring how systems learn to speak.
 
 ---
 
 ## 🧠 The Motivation: From Brute-Force to Structured Speech
 
-The TTS industry has a scaling problem. Most modern engines treat human expression like a brute-force math problem — large autoregressive decoders guess emotional state token by token. But human emotion isn't a split-second dice roll; it's a **global state of mind** that shapes an entire sentence before we even open our mouths.
+Most modern engines treat human expression like a brute-force math problem — large autoregressive decoders guess emotional state token by token. But human emotion isn't a split-second dice roll; it's a **global state of mind** that shapes an entire sentence before we even open our mouths.
 
 By forcing a single network to calculate pronunciation, rhythm, and emotion at the same millisecond, current solutions require massive hardware clusters to overcome architectural inefficiencies.
 
-**SeedVox solves this by introducing the world's first JEPA Prosody Planner:**
+**SeedVox solves this by introducing the JEPA Prosody Planner:**
 
 - 🧩 **The "What" (Sequential AR Planning):** A dedicated Autoregressive Transformer handles phonetics and acoustic token generation, ensuring stable, hallucination-free speech anchoring.
 - 🎭 **The "How" (JEPA World Model):** A Joint-Embedding Predictive Architecture analyzes the entire semantic context at once, projecting overall expressive intent into a global latent space *before* generation begins.
@@ -98,6 +97,7 @@ python -m explicit_pros_phon_planner.infer \
     --play \
     --output output.wav
 ```
+![Ultra-Res Braille Waveform Preview](waveform_braille.svg)
 
 **Example output:**
 ```
@@ -105,7 +105,6 @@ Input Text (Raw): 'The quick brown fox jumps over the lazy dog.'
 Input Text (Norm): 'the quick brown fox jumps over the lazy dog.'
 BPE Tokens: 'the quick brown fox jumps over the lazy dog.'
 Planned Phonemes: DH AH0   K W IH1 K   B R AW1 N   F AA1 K S   JH AH1 M P S   OW2 V ER0   DH AH0   L EY1 Z IY0   D AA1 G .
-Sampling random prosody (variant axis)...
 Encoding context and planning prosody...
 Extracting prosody embeddings for viz...
 Saved generated audio to output.wav
@@ -126,8 +125,11 @@ Performance Metrics:
 ### 🚀 Features
 - 🎯 **Deterministic Synthesis**: Use `--seed <INT>` for reproducible results.
 - ⚡ **Optimized Inference**: Gradient checkpointing, Fused AdamW, and `torch.compile` keep latencies under 400ms on consumer GPUs (RTX 30/40/50 series).
+- 🎭 **N-Variant Generation**: Synthesize multiple variants along the **prosody** (`--variant_axis pros`) or **speaker** (`--variant_axis speaker`) axes to explore the latent space.
 - 📊 **High-Resolution Visualization**: Built-in terminal-based waveform renderer.
-- 🔧 **LoRA Fine-Tuning**: Adapt the model to new voices or domains with lightweight low-rank adapters.
+- 🔧 **LoRA Fine-Tuning**: Adapt the model to new voices or domains with lightweight low-rank adapters. Supports checkpointed LoRA inference via `--lora_checkpoint`.
+- ⚙️ **CFG Scale Tuning**: Adjust classifier-free guidance strength with `--cfg_scale` to balance prosody diversity vs. reference fidelity.
+- 🌡️ **Temperature Tuning**: Control sampling stochasticity across phoneme planning, prosody planning, and acoustic generation with `--phoneme_temperature`, `--prosody_temperature`, and `--acoustic_temperature`.
 
 ---
 

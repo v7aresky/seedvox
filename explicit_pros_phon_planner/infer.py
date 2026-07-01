@@ -754,7 +754,7 @@ if __name__ == "__main__":
     
     # Variant generation options
     parser.add_argument("--variant_n", type=int, default=1, help="Number of variants to generate")
-    parser.add_argument("--variant_axis", choices=['pros', 'speaker'], default='pros',
+    parser.add_argument("--variant_axis", choices=['pros', 'speaker'], default=None,
                         help="Axis to vary: 'pros' (different prosody, same speaker) or 'speaker' (different speakers, same prosody)")
 
     # LoRA adapter options
