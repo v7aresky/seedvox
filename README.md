@@ -81,10 +81,21 @@ graph TD
 ## ⚡ Quick Start (Inference)
 
 ```bash
+# Basic inference
 python -m explicit_pros_phon_planner.infer \
     --config ./configs/light_fusion_r3.json \
     --checkpoint ./checkpoints/seedvox_light_fusion_epoch_55.pt \
     --text "The quick brown fox jumps over the lazy dog." \
+    --output output.wav
+
+# Optimized inference with compilation and metrics
+python -m explicit_pros_phon_planner.infer \
+    --config ./configs/light_fusion_r3.json \
+    --checkpoint ./checkpoints/seedvox_light_fusion_epoch_55.pt \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --compile \
+    --log_metrics \
+    --play \
     --output output.wav
 ```
 
@@ -98,6 +109,18 @@ Sampling random prosody (variant axis)...
 Encoding context and planning prosody...
 Extracting prosody embeddings for viz...
 Saved generated audio to output.wav
+
+==============================
+Performance Metrics:
+  Compilation Time:  8.47s (subsequent runs skip this)
+  Planner:           Phonetics 135.3ms; Prosody 11.8ms
+  Acoustic Gen:      1707.8ms
+  Mimi Decode:       13.6ms
+------------------------------
+  Total Latency:     1951.6ms
+  Audio Duration:    2.88s
+  Real-time Factor:  0.6776x
+==============================
 ```
 
 ### 🚀 Features
