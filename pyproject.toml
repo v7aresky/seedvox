@@ -27,4 +27,5 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["seedvox", "explicit_pros_phon_planner"]
+package-dir = {"" = "src", "explicit_pros_phon_planner" = "."}
 
