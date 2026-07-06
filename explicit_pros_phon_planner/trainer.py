@@ -54,7 +54,7 @@ class ExplicitTrainer(SeedVoxTrainer):
     """
     def __init__(self, config, device, resume_path=None, ref_wav=None, g2p_backend='espeak', num_workers=None):
         # We call super().__init__ first
-        super().__init__(config, device, resume_path=None, ref_wav=ref_wav, g2p_backend=g2p_backend)
+        super().__init__(config, device, resume_path=resume_path, ref_wav=ref_wav, g2p_backend=g2p_backend)
         
         if num_workers is not None:
             self.cfg['training']['num_workers'] = num_workers
@@ -87,7 +87,6 @@ class ExplicitTrainer(SeedVoxTrainer):
         # Override the DataLoader to use the Parallel G2P Collator
         self._reinit_dataloader()
 
-        self.ph_planner_criterion = nn.CrossEntropyLoss(ignore_index=0)
         # Define weights to prioritize EOS token (index 128)
         # Assuming phoneme_vocab_size + 1 = 129
         weights = torch.ones(129, device=device)
@@ -122,6 +121,9 @@ class ExplicitTrainer(SeedVoxTrainer):
         else:
             train_paths = self.cfg['training']['train_tokens_path']
             if isinstance(train_paths, str): train_paths = [train_paths]
+            for p in train_paths:
+                if not os.path.exists(p):
+                    raise FileNotFoundError(f"Training data not found: {p} (from config['training']['train_tokens_path'])")
             full_ds = TokenizedSpeechDataset(train_paths, self.tokenizer)
             val_ratio = self.cfg['training'].get('val_ratio', 0.05)
             n_val = max(1, int(len(full_ds) * val_ratio))
@@ -156,7 +158,7 @@ class ExplicitTrainer(SeedVoxTrainer):
         with torch.no_grad():
             mimi_latents = self.mimi.decode_latent(padded_audio[:, :self.model.n_q//2])
             
-        logits, targets, ph_planner_logits, jepa_loss, _ = self.model(
+        logits, targets, ph_planner_logits, jepa_loss, *_ = self.model(
             padded_text, padded_audio[:, :self.model.n_q], t_lens, a_lens, raw_texts=raw_texts,
             phoneme_ids=ph_targets, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
@@ -165,7 +167,7 @@ class ExplicitTrainer(SeedVoxTrainer):
         
         loss_ar = 0
         for k in range(self.model.n_q):
-            loss_ar += self.criterion(logits[k].view(-1, logits.shape[-1]), targets[:, k].reshape(-1))
+            loss_ar += self.criterion(logits[k].reshape(-1, logits.shape[-1]), targets[:, k].reshape(-1))
         loss_ar /= self.model.n_q
         
         loss_ph_planner = self.ph_planner_criterion(

@@ -281,6 +281,9 @@ class FusionLoRATrainer:
         train_paths = self.cfg['training']['train_tokens_path']
         if isinstance(train_paths, str):
             train_paths = [train_paths]
+        for p in train_paths:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Training data not found: {p} (from config['training']['train_tokens_path'])")
         full_ds = TokenizedSpeechDataset(train_paths, self.tokenizer)
         from torch.utils.data import Subset
         val_ratio = self.cfg['training'].get('val_ratio', 0.05)
@@ -351,7 +354,7 @@ class FusionLoRATrainer:
 
         loss_ar = 0
         for k in range(self.model.n_q):
-            loss_ar += self.criterion(logits[k].view(-1, logits.shape[-1]), targets[:, k].reshape(-1))
+            loss_ar += self.criterion(logits[k].reshape(-1, logits.shape[-1]), targets[:, k].reshape(-1))
         loss_ar /= self.model.n_q
 
         loss_ph_planner = self.ph_planner_criterion(

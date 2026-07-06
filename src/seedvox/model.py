@@ -187,10 +187,8 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
             ae = self.audio_prenet(self.audio_norm(ae))
             mask = torch.arange(audio_tokens.shape[2], device=device).unsqueeze(0) >= audio_lens.unsqueeze(1)
             if use_speaker: spk = self.speaker_encoder(ae, key_padding_mask=mask)
-            if use_prosody: prs = self.prosody_encoder(ae, key_padding_mask=mask)
         else:
             if use_speaker: spk = self.null_speaker.expand(B, -1, -1)
-            if use_prosody: prs = self.null_prosody.expand(B, -1, -1)
 
         # 4. JEPA Prosody Planning
         text_feat_text_rate = text_feat
@@ -278,8 +276,8 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
             drop_prob=drop_prob
         )
-        logits, targets = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens)
-        return logits, targets, ph_logits, jepa_loss, contrastive_loss
+        logits, targets, latent_pred = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens)
+        return logits, targets, ph_logits, jepa_loss, contrastive_loss, latent_pred
 
     @torch.no_grad()
     def sample(self, text, text_lens, ref_audio=None, ref_lens=None, max_steps=1000, temp=0.1, curr_n_q=None, raw_texts=None, top_k=0, top_p=0.9, use_speaker=None, use_prosody=None, cfg_scale=1.0,

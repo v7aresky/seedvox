@@ -79,6 +79,11 @@ class JEPAProsodyBase(StreamingContainer):
             self.dim, self.dim // 64, cfg['depformer_num_layers'],
             int(4.0 * self.dim), causal=True, context=self.n_q, positional_embedding="rope"
         )
+        self.latent_regressor = nn.Sequential(
+            nn.Linear(self.dim, self.dim),
+            nn.GELU(),
+            nn.Linear(self.dim, self.dim),
+        )
         self.cfg = cfg
 
     def encode_text(self, text, text_lens, raw_texts=None):
@@ -125,4 +130,7 @@ class JEPAProsodyBase(StreamingContainer):
         
         d_out = self.dep_transformer(torch.stack(dep_inputs, 2).view(B * T_a_in, self.n_q, -1))
         logits = torch.stack([self.dep_layers[k](d_out[:, k, :]).view(B, T_a_in, self.card + 3) for k in range(self.n_q)], 0)
-        return logits, a_tgt
+        # Predict continuous acoustic latents (for auxiliary L1 loss against mimi.decode_latent output)
+        latent_feat = d_out.view(B, T_a_in, self.n_q, -1).mean(dim=2)
+        latent_pred = self.latent_regressor(latent_feat[:, 1:]).transpose(1, 2)
+        return logits, a_tgt, latent_pred

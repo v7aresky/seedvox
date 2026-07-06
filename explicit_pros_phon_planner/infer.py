@@ -206,6 +206,30 @@ def load_audio(path, device):
     if wav.shape[0] > 1: wav = wav.mean(0, keepdim=True)
     return wav.to(device)
 
+def de_emphasize(wav, coeff=0.95):
+    if coeff <= 0:
+        return wav
+    wav = wav.squeeze(0)
+    y = torch.empty_like(wav)
+    y[0] = wav[0]
+    for t in range(1, wav.shape[-1]):
+        y[t] = wav[t] + coeff * y[t - 1]
+    return y.unsqueeze(0)
+
+
+def temporal_smooth(wav, strength=0.3, kernel_size=7):
+    if strength <= 0 or kernel_size < 3:
+        return wav
+    kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+    sigma = kernel_size / 6.0
+    t = torch.arange(kernel_size, device=wav.device, dtype=wav.dtype) - kernel_size // 2
+    kernel = torch.exp(-0.5 * (t / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+    kernel = kernel.view(1, 1, -1)
+    blurred = torch.nn.functional.conv1d(wav, kernel, padding=kernel_size // 2)
+    return (1 - strength) * wav + strength * blurred
+
+
 def _sum_embeddings(emb_list, tokens, n_q):
     ae = emb_list[0](tokens[:, 0])
     for k in range(1, n_q):
@@ -360,6 +384,9 @@ def run_inference(args):
         print("\033[94m[Inference]\033[0m Using ExplicitPlannerModel")
         model_cls = ExplicitPlannerModel
         
+    if args.refiner_checkpoint:
+        cfg['model']['use_refinement'] = True
+
     model = model_cls(cfg, tokenizer.vocab_size, phoneme_vocab_size=128).to(device)
     
     if args.checkpoint:
@@ -377,6 +404,16 @@ def run_inference(args):
                 print(f"@@@@ Loading model weights from {args.checkpoint}...")
             state_dict = ckpt
         model.load_state_dict(state_dict, strict=False)
+
+    if args.refiner_checkpoint:
+        print(f"@@@@@ Loading NAR Refiner weights from {args.refiner_checkpoint}...")
+        ref_ckpt = torch.load(args.refiner_checkpoint, map_location=device)
+        ref_sd = ref_ckpt.get('light_refiner', ref_ckpt)
+        if model.light_refiner is not None:
+            model.light_refiner.load_state_dict(ref_sd, strict=False)
+            model.use_refinement = True
+        else:
+            print("\033[91m[Warning]\033[0m Refiner checkpoint provided but model has no light_refiner module.")
 
     # 1b. LoRA injection (if provided)
     if args.lora_checkpoint:
@@ -667,7 +704,10 @@ def run_inference(args):
             fade_len = min(240, wav.shape[-1] // 4)  # 10ms at 24kHz
             fade = torch.linspace(0.0, 1.0, fade_len, device=wav.device, dtype=wav.dtype)
             wav[..., :fade_len] *= fade
-            wav[..., :fade_len] *= 0.90
+            if args.de_emph > 0:
+                wav = de_emphasize(wav, coeff=args.de_emph)
+            if args.smooth > 0:
+                wav = temporal_smooth(wav, strength=args.smooth, kernel_size=args.smooth_kernel)
             if device.type == 'cuda': torch.cuda.synchronize()
         metrics['mimi_decode_ms'] = (time.time() - dec_start) * 1000
 
@@ -751,11 +791,24 @@ if __name__ == "__main__":
     parser.add_argument("--view_waveform", action="store_true", help="View static waveform")
     parser.add_argument("--log_metrics", action="store_true", help="Log performance metrics (latency, RTF)")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile for faster inference")
+
+    # Temporal smoothing
+    parser.add_argument("--smooth", type=float, default=0.0,
+                        help="Temporal smoothing strength (0=none, 1=full). "
+                             "Reduces Mimi codec frame-rate artifacts.")
+    parser.add_argument("--smooth_kernel", type=int, default=7,
+                        help="Kernel size for temporal smoothing (odd number, default 7)")
+    parser.add_argument("--de_emph", type=float, default=0.0,
+                        help="De-emphasis coefficient (0=off, typical 0.85-0.97). "
+                             "Restores spectral tilt if model was trained with pre-emphasized audio.")
     
     # Variant generation options
     parser.add_argument("--variant_n", type=int, default=1, help="Number of variants to generate")
     parser.add_argument("--variant_axis", choices=['pros', 'speaker'], default=None,
                         help="Axis to vary: 'pros' (different prosody, same speaker) or 'speaker' (different speakers, same prosody)")
+
+    # NAR Refiner options
+    parser.add_argument("--refiner_checkpoint", type=str, default=None, help="Optional lightweight refiner weights to apply for eliminating spectral wobble")
 
     # LoRA adapter options
     parser.add_argument("--lora_checkpoint", type=str, default=None, help="LoRA adapter weights to apply on top of base checkpoint")

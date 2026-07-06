@@ -77,6 +77,9 @@ class SeedVoxTrainer:
         # 3. Data
         train_paths = self.cfg['training']['train_tokens_path']
         if isinstance(train_paths, str): train_paths = [train_paths]
+        for p in train_paths:
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Training data not found: {p} (from config['training']['train_tokens_path'])")
         full_ds = TokenizedSpeechDataset(train_paths, self.tokenizer)
         val_ratio = self.cfg['training'].get('val_ratio', 0.05)
         n_val = max(1, int(len(full_ds) * val_ratio))
@@ -205,7 +208,7 @@ class SeedVoxTrainer:
             mimi_latents = self.mimi.decode_latent(a_toks[:, :self.jepa_n_q])
             
         # 3. Model Forward
-        logits, targets, ph_logits, jepa_loss, phonetic_loss = self.model(
+        logits, targets, ph_logits, jepa_loss, *_ = self.model(
             t_ids, a_toks[:, :self.model.n_q], t_lens, a_lens, raw_texts=raw_texts,
             phoneme_ids=ph_targets, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,

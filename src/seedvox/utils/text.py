@@ -1,7 +1,6 @@
 import re
 import unicodedata
 import torch
-import math
 from seedvox.utils.tokenizer import PhonemeTokenizer
 from seedvox.utils.g2p_factory import get_phoneme_generator
 
@@ -54,20 +53,57 @@ def _expand_currency(text):
     text = re.sub(r'\$(\d+)', lambda m: _int_to_words(int(m.group(1))) + (' dollar' if m.group(1) == '1' else ' dollars'), text)
     text = re.sub(r'£(\d+)', lambda m: _int_to_words(int(m.group(1))) + (' pound' if m.group(1) == '1' else ' pounds'), text)
     text = re.sub(r'€(\d+)', lambda m: _int_to_words(int(m.group(1))) + (' euro' if m.group(1) == '1' else ' euros'), text)
+    text = re.sub(r'¥(\d+)', lambda m: _int_to_words(int(m.group(1))) + (' yen' if m.group(1) == '1' else ' yen'), text)
     return text
 
-_ordinal_map = {'1st': 'first', '2nd': 'second', '3rd': 'third', '4th': 'fourth', '5th': 'fifth', '6th': 'sixth', '7th': 'seventh', '8th': 'eighth', '9th': 'ninth', '10th': 'tenth'}
-def _expand_ordinals(text):
-    return re.sub(r'\b\d{1,2}(?:st|nd|rd|th)\b', lambda m: _ordinal_map.get(m.group(0).lower(), m.group(0)), text, flags=re.IGNORECASE)
+def _ordinal_to_words(n):
+    words = _int_to_words(n).split()
+    last = words[-1]
+    overrides = {
+        'one': 'first', 'two': 'second', 'three': 'third',
+        'five': 'fifth', 'eight': 'eighth', 'nine': 'ninth', 'twelve': 'twelfth',
+    }
+    if last in overrides:
+        last_ordinal = overrides[last]
+    elif last.endswith('ty'):
+        last_ordinal = last[:-1] + 'ieth'
+    else:
+        last_ordinal = last + 'th'
+    if len(words) == 1:
+        return last_ordinal
+    return ' '.join(words[:-1]) + ' ' + last_ordinal
 
-_abbreviations = [(re.compile(r'\bMr\.', re.IGNORECASE), 'Mister'), (re.compile(r'\bMrs\.', re.IGNORECASE), 'Missis'), (re.compile(r'\bMs\.', re.IGNORECASE), 'Miss'), (re.compile(r'\bDr\.', re.IGNORECASE), 'Doctor'), (re.compile(r'\betc\.', re.IGNORECASE), 'et cetera')]
+def _expand_ordinals(text):
+    return re.sub(r'\b(\d+)(?:st|nd|rd|th)\b', lambda m: _ordinal_to_words(int(m.group(1))), text, flags=re.IGNORECASE)
+
+_abbreviations = [
+    (re.compile(r'\bMr\.', re.IGNORECASE), 'Mister'),
+    (re.compile(r'\bMrs\.', re.IGNORECASE), 'Missis'),
+    (re.compile(r'\bMs\.', re.IGNORECASE), 'Miss'),
+    (re.compile(r'\bDr\.', re.IGNORECASE), 'Doctor'),
+    (re.compile(r'\betc\.', re.IGNORECASE), 'et cetera'),
+    (re.compile(r'\be\.g\.', re.IGNORECASE), 'for example'),
+    (re.compile(r'\bi\.e\.', re.IGNORECASE), 'that is'),
+    (re.compile(r'\bvs\.', re.IGNORECASE), 'versus'),
+    (re.compile(r'\bSt\.', re.IGNORECASE), 'saint'),
+    (re.compile(r'\bJr\.', re.IGNORECASE), 'junior'),
+    (re.compile(r'\bSr\.', re.IGNORECASE), 'senior'),
+    (re.compile(r'\bDept\.', re.IGNORECASE), 'department'),
+    (re.compile(r'\bEst\.', re.IGNORECASE), 'established'),
+    (re.compile(r'\bAve\.', re.IGNORECASE), 'avenue'),
+    (re.compile(r'\bBlvd\.', re.IGNORECASE), 'boulevard'),
+    (re.compile(r'\bRd\.', re.IGNORECASE), 'road'),
+    (re.compile(r'\bInc\.', re.IGNORECASE), 'incorporated'),
+    (re.compile(r'\bCorp\.', re.IGNORECASE), 'corporation'),
+    (re.compile(r'\bLtd\.', re.IGNORECASE), 'limited'),
+]
 def _expand_abbreviations(text):
     for regex, replacement in _abbreviations: text = regex.sub(replacement, text)
     return text
 
 _letter_to_word = {
     'a': 'ay', 'b': 'bee', 'c': 'see', 'd': 'dee', 'e': 'ee', 'f': 'ef', 'g': 'jee',
-    'h': 'aitch', 'i': 'eye', 'j': 'jay', 'k': 'kay', 'l': 'el', 'm': 'em', 'n': 'en',
+    'h': 'aitch', 'j': 'jay', 'k': 'kay', 'l': 'el', 'm': 'em', 'n': 'en',
     'o': 'oh', 'p': 'pee', 'q': 'cue', 'r': 'are', 's': 'ess', 't': 'tee', 'u': 'you',
     'v': 'vee', 'w': 'double u', 'x': 'ex', 'y': 'wye', 'z': 'zee'
 }
@@ -76,14 +112,80 @@ def _expand_isolated_letters(text):
     def _replace_letter(m):
         l = m.group(1).lower()
         return _letter_to_word.get(l, l)
-    return re.sub(r'\b([A-Za-z])\b', _replace_letter, text)
+    # Exclude uppercase 'I' (always the pronoun), include 'i' (rare but possible)
+    return re.sub(r'\b([A-HJ-Za-z])\b', _replace_letter, text)
+
+def _dissolve_initials(text):
+    # "A.B.C." -> "A B C"  (dots between isolated-letter initials, NOT part of words like "domain.com")
+    text = re.sub(r'(?<!\w)([A-Za-z])\.(?=[A-Za-z])', r'\1 ', text)
+    text = re.sub(r'(?<!\w)([A-Za-z])\.(?=\s|$)', r'\1', text)
+    return text
+
+def _expand_time(text):
+    _time_re = re.compile(
+        r'\b((0?[0-9])|(1[0-1])|(1[2-9])|(2[0-3]))'
+        r':([0-5][0-9])'
+        r'(?:[ ]*(a\.m\.|am|pm|p\.m\.|a\.m|p\.m))?\b',
+        re.IGNORECASE | re.X,
+    )
+    _hour_re = re.compile(
+        r'\b(\d{1,2})\s*(a\.m\.|am|pm|p\.m\.|a\.m|p\.m)\b',
+        re.IGNORECASE,
+    )
+    def _replace_time(m):
+        hour = int(m.group(1))
+        past_noon = hour >= 12
+        if hour > 12:
+            hour -= 12
+        elif hour == 0:
+            hour = 12
+            past_noon = False
+        parts = [_int_to_words(hour)]
+        minute = int(m.group(6))
+        if minute > 0:
+            if minute < 10:
+                parts.append('oh')
+            parts.append(_int_to_words(minute))
+        am_pm = m.group(7)
+        if am_pm is None:
+            parts.append('p m' if past_noon else 'a m')
+        else:
+            parts.extend(list(am_pm.replace('.', '')))
+        return ' '.join(parts)
+    def _replace_hour(m):
+        hour = int(m.group(1))
+        past_noon = hour >= 12
+        if hour > 12:
+            hour -= 12
+        elif hour == 0:
+            hour = 12
+            past_noon = False
+        parts = [_int_to_words(hour)]
+        am_pm = m.group(2)
+        parts.extend(list(am_pm.replace('.', '')))
+        return ' '.join(parts)
+    text = _time_re.sub(_replace_time, text)
+    text = _hour_re.sub(_replace_hour, text)
+    return text
+
+def _replace_symbols(text):
+    text = text.replace('&', ' and ')
+    text = text.replace('%', ' percent ')
+    text = text.replace('+', ' plus ')
+    text = text.replace('=', ' equals ')
+    text = text.replace('@', ' at ')
+    return text
 
 def normalize_text(text):
+    text = _expand_currency(text)
     text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
     text = _expand_abbreviations(text)
-    text = _expand_currency(text)
+    text = _dissolve_initials(text)
+    text = _expand_time(text)
     text = _expand_ordinals(text)
+    text = _replace_symbols(text)
     text = _expand_isolated_letters(text)
+    text = re.sub(r'\b\d+\.\d+\b', _number_to_words, text)
     text = re.sub(r'\d+', _number_to_words, text)
     return re.sub(r'\s+', ' ', text).strip().lower()
 
