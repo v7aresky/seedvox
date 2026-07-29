@@ -20,6 +20,44 @@ from .utils import PhoneticGenerator, collate_phonemes
 from .trainer import ExplicitCollate
 
 
+def collate_fn_with_wav(batch):
+    """Like base collate_fn but also returns padded_wav for reconstruction loss."""
+    text_ids, audio_tokens, raw_texts, ph_ids, wavs = zip(*batch)
+
+    t_lens = torch.tensor([len(t) for t in text_ids], dtype=torch.long)
+    t_max = ((t_lens.max().item() + 7) // 8) * 8
+    padded_text = torch.full((len(text_ids), t_max), 0, dtype=torch.long)
+    for i, t in enumerate(text_ids): padded_text[i, :len(t)] = t
+
+    k_max = max(a.shape[0] for a in audio_tokens)
+    a_max = max(a.shape[1] for a in audio_tokens)
+    a_max = ((a_max + 7) // 8) * 8
+    padded_audio = torch.zeros(len(audio_tokens), k_max, a_max, dtype=torch.long)
+    for i, a in enumerate(audio_tokens):
+        padded_audio[i, :a.shape[0], :a.shape[1]] = a
+    a_lens = torch.tensor([a.shape[1] for a in audio_tokens], dtype=torch.long)
+
+    padded_ph = None
+    if any(p is not None for p in ph_ids):
+        ph_list = [p if p is not None else torch.tensor([], dtype=torch.long) for p in ph_ids]
+        ph_lens = torch.tensor([len(p) for p in ph_list], dtype=torch.long)
+        p_max = ph_lens.max().item()
+        padded_ph = torch.full((len(ph_list), p_max), 0, dtype=torch.long)
+        for i, p in enumerate(ph_list):
+            if len(p) > 0: padded_ph[i, :len(p)] = p
+
+    padded_wav = None
+    if any(w is not None for w in wavs):
+        wav_list = [w if w is not None else torch.tensor([], dtype=torch.float32) for w in wavs]
+        wav_lens = torch.tensor([w.shape[0] for w in wav_list], dtype=torch.long)
+        w_max = wav_lens.max().item()
+        padded_wav = torch.zeros(len(wav_list), w_max, dtype=torch.float32)
+        for i, w in enumerate(wav_list):
+            if w.shape[0] > 0: padded_wav[i, :w.shape[0]] = w
+
+    return padded_text, padded_audio, t_lens, a_lens, raw_texts, padded_ph, padded_wav
+
+
 class LoRALinear(nn.Module):
     def __init__(self, original_linear, r=8, alpha=16, dropout=0.0):
         super().__init__()
@@ -182,16 +220,18 @@ class LoRAConvTranspose1d(nn.Module):
             stride=self.original_convtr.stride,
             padding=self.original_convtr.padding,
             dilation=self.original_convtr.dilation,
-            groups=self.original_convtr.groups if self.r % self.original_convtr.groups == 0 else 1
+            groups=self.original_convtr.groups if self.original_convtr.groups == 1 or self.r % self.original_convtr.groups == 0 else 1
         )
+        if x_lora.shape[-1] > original_output.shape[-1]:
+            x_lora = x_lora[..., :original_output.shape[-1]]
         return original_output + x_lora * self.scaling
 
 
-def inject_lora(model, rank=8, alpha=16, skip_if_lora=True):
+def inject_lora(model, rank=8, alpha=16, skip_if_lora=True, targets=None):
     print(f"Injecting LoRA (rank={rank}, alpha={alpha}) into model...")
 
     count = 0
-    targets = [
+    target_list = targets or [
         "text_encoder", "decoder_layers", "dep_transformer",
         "dep_in", "dep_layers", "speaker_encoder",
         "prosody_encoder", "audio_prenet",
@@ -206,7 +246,7 @@ def inject_lora(model, rank=8, alpha=16, skip_if_lora=True):
         for child_name, child_module in module.named_children():
             full_child_name = f"{name}.{child_name}" if name else child_name
 
-            if any(t in full_child_name for t in targets):
+            if any(t in full_child_name for t in target_list):
                 if isinstance(child_module, nn.Linear) and not isinstance(child_module, (LoRALinear, LoRAConv1d, LoRAConvTranspose1d)):
                     replacements.append((module, child_name, child_module, "linear"))
                 elif isinstance(child_module, nn.Conv1d) and not isinstance(child_module, (LoRAConv1d, LoRAConvTranspose1d)):
@@ -232,14 +272,26 @@ def inject_lora(model, rank=8, alpha=16, skip_if_lora=True):
     return model
 
 
+MIMI_DECODER_TARGETS = [
+    "decoder_transformer",
+    "decoder",
+    "upsample",
+]
+
+
 class FusionLoRATrainer:
     def __init__(self, config, device, base_checkpoint, g2p_backend='espeak',
                  resume_lora=None, ref_wav=None, num_workers=None,
-                 lora_rank=16, lora_alpha=32, adapt_mimi=False):
+                 lora_rank=16, lora_alpha=32, adapt_mimi=False,
+                 mimi_lora_rank=8, mimi_lora_alpha=16):
         self.cfg, self.device = config, device
         self.tokenizer = None
         self.ref_wav_path = ref_wav
         self.adapt_mimi = adapt_mimi
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.mimi_lora_rank = mimi_lora_rank
+        self.mimi_lora_alpha = mimi_lora_alpha
 
         # 1. Initialize tokenizer first to know real vocab size
         if self.tokenizer is None:
@@ -266,10 +318,11 @@ class FusionLoRATrainer:
         # 4. Inject LoRA into model
         self.model = inject_lora(self.model, rank=lora_rank, alpha=lora_alpha)
 
-        # Optionally inject into Mimi decoder
+        # Optionally inject into Mimi decoder (with MIMI_DECODER_TARGETS)
         if adapt_mimi:
             print("Enabling LoRA adaptation for Mimi decoder...")
-            self.mimi = inject_lora(self.mimi, rank=lora_rank, alpha=lora_alpha)
+            self.mimi = inject_lora(self.mimi, rank=mimi_lora_rank, alpha=mimi_lora_alpha,
+                                    targets=MIMI_DECODER_TARGETS)
 
         self.model.to(device)
         self.mimi.to(device)
@@ -277,14 +330,19 @@ class FusionLoRATrainer:
         # 5. Phoneme generator & collator
         self.ph_generator = PhoneticGenerator(backend=g2p_backend, phoneme_vocab_size=128)
 
-        # 6. Dataset
+        # 6. Dataset (with wav loading for reconstruction loss)
         train_paths = self.cfg['training']['train_tokens_path']
         if isinstance(train_paths, str):
             train_paths = [train_paths]
         for p in train_paths:
             if not os.path.exists(p):
                 raise FileNotFoundError(f"Training data not found: {p} (from config['training']['train_tokens_path'])")
-        full_ds = TokenizedSpeechDataset(train_paths, self.tokenizer)
+        full_ds = TokenizedSpeechDataset(train_paths, self.tokenizer, return_wav=adapt_mimi)
+        # Debug: check if wavs are present
+        if adapt_mimi and len(full_ds) > 0:
+            sample = full_ds[0]
+            has_wav = sample[-1] is not None if len(sample) >= 5 else False
+            print(f"[DEBUG] Dataset has_wav={has_wav} (item keys: {list(full_ds.data[0].keys())})")
         from torch.utils.data import Subset
         val_ratio = self.cfg['training'].get('val_ratio', 0.05)
         n_val = max(1, int(len(full_ds) * val_ratio))
@@ -318,6 +376,23 @@ class FusionLoRATrainer:
         self.scaler = torch.amp.GradScaler("cuda")
         self.criterion = nn.CrossEntropyLoss(ignore_index=-1)
         self.ph_planner_criterion = nn.CrossEntropyLoss(ignore_index=0)
+        nq = self.model.n_q
+        w = torch.ones(nq)
+        w[:nq // 2] = 1.5
+        w[nq // 2:] = 0.5
+        self.level_weights = (w / w.sum() * nq).to(device)
+
+        # 8. Mimi decoder reconstruction loss (BigVGAN-style)
+        self.recon_loss_fn = None
+        if adapt_mimi:
+            from .losses import MimiDecoderReconLoss
+            self.recon_loss_fn = MimiDecoderReconLoss(
+                sample_rate=24000,
+                mel_weight=self.cfg['training'].get('mel_weight', 45.0),
+                stft_weight=self.cfg['training'].get('stft_weight', 0.0),
+            ).to(device)
+            self.recon_weight = self.cfg['training'].get('recon_weight', 0.1)
+
         self.global_step = 0
         self.start_epoch = 0
 
@@ -328,34 +403,76 @@ class FusionLoRATrainer:
         if resume_lora and os.path.exists(resume_lora):
             raw = torch.load(resume_lora, map_location=device)
             lora_state = raw.get('lora_state_dict', raw)
+            # Validate rank/alpha from checkpoint against CLI args
+            ckpt_rank = raw.get('lora_rank')
+            ckpt_alpha = raw.get('lora_alpha')
+            if ckpt_rank is not None and ckpt_rank != self.lora_rank:
+                print(f"\033[93m[Warning]\033[0m Checkpoint lora_rank={ckpt_rank} != CLI lora_rank={self.lora_rank}, re-injecting LoRA with checkpoint rank.")
+                self.lora_rank = ckpt_rank
+                self.model = inject_lora(self.model, rank=self.lora_rank, alpha=self.lora_alpha)
+            if ckpt_alpha is not None and ckpt_alpha != self.lora_alpha:
+                self.lora_alpha = ckpt_alpha
             model_lora = {k: v for k, v in lora_state.items() if not k.startswith("mimi.")}
             mimi_lora = {k[5:]: v for k, v in lora_state.items() if k.startswith("mimi.")}
             self.model.load_state_dict(model_lora, strict=False)
             if mimi_lora:
+                ckpt_mimi_rank = raw.get('mimi_lora_rank')
+                ckpt_mimi_alpha = raw.get('mimi_lora_alpha')
+                if ckpt_mimi_rank is not None and ckpt_mimi_rank != self.mimi_lora_rank:
+                    print(f"\033[93m[Warning]\033[0m Checkpoint mimi_lora_rank={ckpt_mimi_rank} != CLI mimi_lora_rank={self.mimi_lora_rank}, re-injecting Mimi LoRA with checkpoint rank.")
+                    self.mimi_lora_rank = ckpt_mimi_rank
+                    self.mimi = inject_lora(self.mimi, rank=self.mimi_lora_rank, alpha=self.mimi_lora_alpha, targets=MIMI_DECODER_TARGETS)
+                if ckpt_mimi_alpha is not None and ckpt_mimi_alpha != self.mimi_lora_alpha:
+                    self.mimi_lora_alpha = ckpt_mimi_alpha
                 self.mimi.load_state_dict(mimi_lora, strict=False)
-            print(f"Resumed LoRA weights from {resume_lora}")
+            # Restore optimizer, scheduler, scaler, epoch, global_step
+            if 'optimizer' in raw:
+                self.optimizer.load_state_dict(raw['optimizer'])
+            if 'scheduler' in raw:
+                self.scheduler.load_state_dict(raw['scheduler'])
+            if 'scaler' in raw:
+                self.scaler.load_state_dict(raw['scaler'])
+            if 'epoch' in raw:
+                self.start_epoch = raw['epoch']
+            if 'global_step' in raw:
+                self.global_step = raw['global_step']
+            print(f"Resumed LoRA weights from {resume_lora} (epoch={self.start_epoch}, step={self.global_step})")
 
     def _compute_loss(self, batch):
-        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets = batch
+        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, padded_wav = batch
 
         padded_text = padded_text.to(self.device)
         padded_audio = padded_audio.to(self.device)
         t_lens, a_lens = t_lens.to(self.device), a_lens.to(self.device)
         ph_targets = ph_targets.to(self.device)
+        if padded_wav is not None:
+            padded_wav = padded_wav.to(self.device)
 
         with torch.no_grad():
             mimi_latents = self.mimi.decode_latent(padded_audio[:, :self.model.n_q // 2])
 
-        logits, targets, ph_planner_logits, jepa_loss, _ = self.model(
+        logits, targets, ph_planner_logits, jepa_loss, _, latent_pred = self.model(
             padded_text, padded_audio[:, :self.model.n_q], t_lens, a_lens,
             raw_texts=raw_texts, phoneme_ids=ph_targets, mimi_latents=mimi_latents,
             drop_prob=0.1
         )
 
-        loss_ar = 0
-        for k in range(self.model.n_q):
-            loss_ar += self.criterion(logits[k].reshape(-1, logits.shape[-1]), targets[:, k].reshape(-1))
-        loss_ar /= self.model.n_q
+        B = targets.shape[0]
+        n_q = self.model.n_q
+        T_audio = targets.shape[2]
+        curriculum = self.cfg['training'].get('curriculum_n_q', {})
+        if curriculum.get('enabled', False):
+            start = curriculum.get('start_codebooks', 4)
+            ramp = curriculum.get('ramp_steps', 50000)
+            num_enabled = min(n_q, start + int(self.global_step * (n_q - start) / ramp))
+        else:
+            num_enabled = n_q
+        logits_btk = logits.permute(1, 2, 0, 3).reshape(B * T_audio * n_q, logits.shape[-1])
+        targets_btk = targets.permute(0, 2, 1).reshape(B * T_audio * n_q)
+        weights_ar = torch.zeros(n_q, device=self.device)
+        weights_ar[:num_enabled] = self.level_weights[:num_enabled]
+        weights_flat = weights_ar[None, None, :].expand(B, T_audio, n_q).reshape(B * T_audio * n_q)
+        loss_ar = (F.cross_entropy(logits_btk, targets_btk, reduction='none', ignore_index=-1) * weights_flat).sum() / max(B * T_audio * num_enabled, 1)
 
         loss_ph_planner = self.ph_planner_criterion(
             ph_planner_logits.reshape(-1, ph_planner_logits.shape[-1]),
@@ -368,7 +485,22 @@ class FusionLoRATrainer:
                       self.cfg['training'].get('ph_planner_weight', 1.0) * loss_ph_planner +
                       self.cfg['training'].get('jepa_weight', 2.0) * loss_jepa)
 
-        return total_loss, loss_ar, loss_jepa, loss_ph_planner
+        # Mimi decoder reconstruction loss (BigVGAN-style)
+        loss_recon = torch.tensor(0.0, device=self.device)
+        if self.adapt_mimi and self.recon_loss_fn is not None and padded_wav is not None:
+            with torch.no_grad():
+                pred_tokens = torch.stack(
+                    [logits[k].argmax(dim=-1) for k in range(self.model.n_q)], dim=1
+                )
+            pred_tokens_clamped = pred_tokens.clamp(0, self.model.card - 1)
+            recon_audio = self.mimi.decode(pred_tokens_clamped)
+            recon_audio = torch.clamp(recon_audio, -1.0, 1.0)
+            loss_recon = self.recon_weight * self.recon_loss_fn(recon_audio, padded_wav.unsqueeze(1))
+            if not torch.isfinite(loss_recon):
+                loss_recon = torch.tensor(0.0, device=self.device)
+            total_loss = total_loss + loss_recon
+
+        return total_loss, loss_ar, loss_jepa, loss_ph_planner, loss_recon
 
     def train(self):
         print("Starting Fusion LoRA training...")
@@ -388,7 +520,7 @@ class FusionLoRATrainer:
                 self.optimizer.zero_grad()
 
                 with torch.amp.autocast("cuda"):
-                    total_loss, loss_ar, loss_jepa, loss_ph = self._compute_loss(batch)
+                    total_loss, loss_ar, loss_jepa, loss_ph, loss_recon = self._compute_loss(batch)
 
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
@@ -405,6 +537,7 @@ class FusionLoRATrainer:
                     ar=f"{loss_ar.item():.3f}",
                     jepa=f"{loss_jepa.item() if isinstance(loss_jepa, torch.Tensor) else loss_jepa:.3f}",
                     ph=f"{loss_ph.item() if isinstance(loss_ph, torch.Tensor) else loss_ph:.3f}",
+                    recon=f"{loss_recon.item():.3f}",
                     total=f"{total_loss.item():.3f}"
                 )
 
@@ -413,6 +546,7 @@ class FusionLoRATrainer:
                     self.writer.add_scalar("lora/loss_ar", loss_ar.item(), self.global_step)
                     self.writer.add_scalar("lora/loss_jepa", loss_jepa.item() if isinstance(loss_jepa, torch.Tensor) else loss_jepa, self.global_step)
                     self.writer.add_scalar("lora/loss_ph", loss_ph.item() if isinstance(loss_ph, torch.Tensor) else loss_ph, self.global_step)
+                    self.writer.add_scalar("lora/loss_recon", loss_recon.item(), self.global_step)
 
             # Validation
             self.model.eval()
@@ -446,11 +580,20 @@ class FusionLoRATrainer:
                 mimi_lora = {f"mimi.{n}": p for n, p in self.mimi.named_parameters() if "lora_" in n}
                 lora_dict.update(mimi_lora)
 
-            torch.save({
+            save_payload = {
                 'lora_state_dict': lora_dict,
-                'lora_rank': self.cfg['training'].get('lora_rank', 16),
-                'lora_alpha': self.cfg['training'].get('lora_alpha', 32),
-            }, f"checkpoints/{output_prefix}_lora_epoch_{epoch}.pt")
+                'lora_rank': self.lora_rank,
+                'lora_alpha': self.lora_alpha,
+                'optimizer': self.optimizer.state_dict(),
+                'scheduler': self.scheduler.state_dict(),
+                'scaler': self.scaler.state_dict(),
+                'epoch': epoch + 1,
+                'global_step': self.global_step,
+            }
+            if self.adapt_mimi:
+                save_payload['mimi_lora_rank'] = self.mimi_lora_rank
+                save_payload['mimi_lora_alpha'] = self.mimi_lora_alpha
+            torch.save(save_payload, f"checkpoints/{output_prefix}_lora_epoch_{epoch}.pt")
             print(f"Saved LoRA adapter: checkpoints/{output_prefix}_lora_epoch_{epoch}.pt")
             torch.cuda.empty_cache()
 
@@ -468,6 +611,8 @@ if __name__ == "__main__":
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--adapt_mimi", action="store_true")
+    parser.add_argument("--mimi_lora_rank", type=int, default=8)
+    parser.add_argument("--mimi_lora_alpha", type=int, default=16)
 
     parser.add_argument("--train_data", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -500,6 +645,8 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
-        adapt_mimi=args.adapt_mimi
+        adapt_mimi=args.adapt_mimi,
+        mimi_lora_rank=args.mimi_lora_rank,
+        mimi_lora_alpha=args.mimi_lora_alpha,
     )
     trainer.train()

@@ -149,30 +149,35 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                        char_lens: tp.Optional[torch.Tensor] = None,
                        drop_prob: float = 0.0, 
                        external_speaker: tp.Optional[torch.Tensor] = None, 
-                       external_prosody: tp.Optional[torch.Tensor] = None) -> tp.Tuple[torch.Tensor, torch.Tensor, tp.Optional[torch.Tensor]]:
+                       external_prosody: tp.Optional[torch.Tensor] = None,
+                       text_feat: tp.Optional[torch.Tensor] = None) -> tp.Tuple[torch.Tensor, torch.Tensor, tp.Optional[torch.Tensor]]:
         
         B, device = text.shape[0], text.device
         if audio_tokens is not None: audio_tokens = audio_tokens[:, :self.n_q]
         
-        # 1. Base Text Encoding
-        text_feat, text_in = self.encode_text(text, text_lens, raw_texts)
+        if text_feat is None:
+            # 1. Base Text Encoding
+            text_feat, _ = self.encode_text(text, text_lens, raw_texts)
+            
+            # 2. BPE Enrichment
+            if self.use_bpe_encoder and bpe_ids is not None:
+                B_bpe, T_char = char_to_bpe.shape
+                padded_c2b = torch.zeros((B, T_char + 2), dtype=char_to_bpe.dtype, device=device)
+                padded_c2b[:, 1:1+T_char] = char_to_bpe
+                wrapped_char_lens = (char_lens if char_lens is not None else text_lens) + 2
+                
+                bpe_ctx = self.bpe_encoder.forward_bpe(bpe_ids, bpe_lens, device=device)
+                bpe_expanded = self.bpe_encoder.expand_to_chars(bpe_ctx, padded_c2b, wrapped_char_lens, device=device)
+                
+                if bpe_expanded.shape[1] < text_feat.shape[1]:
+                    bpe_expanded = F.pad(bpe_expanded, (0, 0, 0, text_feat.shape[1] - bpe_expanded.shape[1]))
+                elif bpe_expanded.shape[1] > text_feat.shape[1]:
+                    bpe_expanded = bpe_expanded[:, :text_feat.shape[1]]
+                text_feat = text_feat + torch.sigmoid(self.bpe_gate) * bpe_expanded
+        else:
+            text_feat = text_feat
+
         text_lens_wrapped = text_lens + 2
-        
-        # 2. BPE Enrichment
-        if self.use_bpe_encoder and bpe_ids is not None:
-            B_bpe, T_char = char_to_bpe.shape
-            padded_c2b = torch.zeros((B, T_char + 2), dtype=char_to_bpe.dtype, device=device)
-            padded_c2b[:, 1:1+T_char] = char_to_bpe
-            wrapped_char_lens = (char_lens if char_lens is not None else text_lens) + 2
-            
-            bpe_ctx = self.bpe_encoder.forward_bpe(bpe_ids, bpe_lens, device=device)
-            bpe_expanded = self.bpe_encoder.expand_to_chars(bpe_ctx, padded_c2b, wrapped_char_lens, device=device)
-            
-            if bpe_expanded.shape[1] < text_feat.shape[1]:
-                bpe_expanded = F.pad(bpe_expanded, (0, 0, 0, text_feat.shape[1] - bpe_expanded.shape[1]))
-            elif bpe_expanded.shape[1] > text_feat.shape[1]:
-                bpe_expanded = bpe_expanded[:, :text_feat.shape[1]]
-            text_feat = text_feat + torch.sigmoid(self.bpe_gate) * bpe_expanded
 
         # 3. Speaker / Prosody Extraction
         spk = None
@@ -205,30 +210,29 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                 a_mask = torch.arange(mimi_latents.shape[2], device=device).unsqueeze(0) >= audio_lens.unsqueeze(1)
                 gt_prosody = self.prosody_bottleneck(mimi_latents, mask=a_mask).detach()
             
-            # Compute JEPA Loss (Targeting the teacher)
-            jepa_loss = F.mse_loss(pred_prosody, gt_prosody)
+            # Compute JEPA Loss (Cosine similarity — focuses on prosody pattern, not magnitude)
+            jepa_loss = 1 - F.cosine_similarity(pred_prosody, gt_prosody, dim=-1).mean()
             current_prosody = pred_prosody
         else:
             # Inference mode
             current_prosody = pred_prosody
 
-        # 5. Speaker Adaptation (FiLM)
-        # Bypassing SpeakerAdapter modulation for Prosody to unify with ExplicitPlannerModel's FiLMAdapter
-        speaker_vector = spk.mean(dim=1, keepdim=True) if spk is not None else torch.zeros(B, 1, self.dim, device=device)
-        # scale, shift = self.speaker_adapter(speaker_vector)
-        # adapted_prosody = current_prosody * scale + shift
-        adapted_prosody = current_prosody
-        
-        # 6. Conditioning Dropout
+        # 5. Conditioning Dropout
         if drop_prob > 0 and self.training:
             keep = (torch.rand(B, 1, 1, device=device) > drop_prob).float()
             if spk is not None:
                 spk = keep * spk + (1 - keep) * self.null_speaker.expand(B, -1, -1)
             
-            adapted_prosody = keep * adapted_prosody + (1 - keep) * self.null_prosody.expand(B, -1, -1)
+            current_prosody = keep * current_prosody + (1 - keep) * self.null_prosody.expand(B, -1, -1)
             
             if torch.rand(1).item() < 0.2:
                 text_feat = keep * text_feat + (1 - keep) * self.null_text_feat.expand(B, text_feat.shape[1], -1)
+
+        # 6. Speaker Adaptation (FiLM) - modulate prosody features with speaker info
+        # Done after dropout so spk_vec (used for AdaLN in decoder) also gets nulled during training
+        speaker_vector = spk.mean(dim=1, keepdim=True) if spk is not None else torch.zeros(B, 1, self.dim, device=device)
+        scale, shift = self.speaker_adapter(speaker_vector)
+        adapted_prosody = current_prosody * scale + shift
 
         # 7. Final Context Assembly
         ctx_parts = []
@@ -239,8 +243,9 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
         
         ctx_mask = torch.zeros(B, context.shape[1], device=device, dtype=torch.bool)
         offset = (spk.shape[1] if spk is not None else 0) + adapted_prosody.shape[1]
-        for b in range(B):
-            ctx_mask[b, offset + text_lens_wrapped[b]:] = True
+        remaining = context.shape[1] - offset
+        arange = torch.arange(remaining, device=device).unsqueeze(0)
+        ctx_mask[:, offset:] = arange >= text_lens_wrapped.unsqueeze(1)
             
         # 8. Phonetic Head
         ph_logits = None
@@ -255,11 +260,11 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
             
             contrastive_loss, _, ph_logits = self.phoneme_head(text_feat, text_lens_wrapped, phoneme_ids)
             
-        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss
+        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, speaker_vector
 
     def mlm_forward(self, masked_text, text_lens, raw_texts=None, phoneme_ids=None,
                     bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None):
-        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss = self.encode_context(
+        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, _ = self.encode_context(
             masked_text, text_lens, raw_texts=raw_texts, phoneme_ids=phoneme_ids,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens
         )
@@ -270,13 +275,13 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                 bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
                 drop_prob=0.0):
         audio_tokens = audio_tokens[:, :self.n_q]
-        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss = self.encode_context(
+        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec = self.encode_context(
             text, text_lens, audio_tokens, audio_lens, raw_texts, 
             use_speaker, use_prosody, phoneme_ids, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
             drop_prob=drop_prob
         )
-        logits, targets, latent_pred = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens)
+        logits, targets, latent_pred = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens, speaker_emb=spk_vec)
         return logits, targets, ph_logits, jepa_loss, contrastive_loss, latent_pred
 
     @torch.no_grad()
@@ -284,7 +289,7 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None, phoneme_ids=None, drop_prob=0.0,
                external_speaker=None, external_prosody=None,
                precomputed_context=None, precomputed_mask=None,
-               offset=None):
+               offset=None, spk_vec=None):
         B, device = text.shape[0], text.device
         if curr_n_q is None: curr_n_q = self.n_q
         
@@ -292,7 +297,7 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
         if precomputed_context is not None:
             context, ctx_mask = precomputed_context, precomputed_mask
         else:
-            context, ctx_mask, _, _, _ = self.encode_context(
+            context, ctx_mask, _, _, _, spk_vec = self.encode_context(
                 text, text_lens, audio_tokens=ref_audio, audio_lens=ref_lens, 
                 raw_texts=raw_texts, use_speaker=use_speaker, use_prosody=use_prosody,
                 bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
@@ -315,6 +320,11 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
             uncond_mask[:, offset:] = True
             context = torch.cat([context, context], dim=0)
             ctx_mask = torch.cat([ctx_mask, uncond_mask], dim=0)
+            # Double speaker vector: real for cond, zeros for uncond
+            if spk_vec is not None:
+                spk_vec = torch.cat([spk_vec, torch.zeros_like(spk_vec)], dim=0)
+            else:
+                spk_vec = torch.zeros(B, 1, self.dim, device=device).repeat(2, 1, 1)
             B_eff = 2 * B
         else:
             B_eff = B
@@ -325,24 +335,31 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
         streams = [layer.self_attn.streaming(B_eff) for layer in self.decoder_layers]
         is_pre_norm = self.decoder_layers[0].pre_norm if len(self.decoder_layers) > 0 else True
         
+        pos_tensor = torch.empty((B_eff, 1), device=device, dtype=torch.long)
         try:
             for layer_stream in streams: layer_stream.__enter__()
             for t in range(max_steps):
+                pos_tensor.fill_(t)
                 in_toks = curr_step_toks if cfg_scale == 1.0 else curr_step_toks.repeat(2, 1, 1)
                 step_emb = self.audio_prenet(self.audio_norm(
                     _sum_embeddings(self.audio_embs, in_toks, self.n_q)
                 ))
                 
                 x = step_emb
+                spk_for_adaln = spk_vec.mean(dim=1) if spk_vec is not None and spk_vec.dim() == 3 else spk_vec
                 for layer in self.decoder_layers:
                     if is_pre_norm:
-                        x = x + layer.self_attn(layer.norm1(x), positions=torch.full((B_eff, 1), t, device=device))
+                        x = x + layer.self_attn(layer.norm1(x), positions=pos_tensor)
                         x = x + layer.cross_attn(layer.norm2(x), kv_input=context, kv_mask=ctx_mask)
+                        if spk_for_adaln is not None:
+                            x = layer.speaker_adaLN(x, spk_for_adaln)
                         x = x + layer.ff(layer.norm3(x))
                     else:
-                        x_self = layer.self_attn(x, positions=torch.full((B_eff, 1), t, device=device))
+                        x_self = layer.self_attn(x, positions=pos_tensor)
                         x = layer.norm1(x + x_self)
                         x = layer.norm2(x + layer.cross_attn(x, kv_input=context, kv_mask=ctx_mask))
+                        if spk_for_adaln is not None:
+                            x = layer.speaker_adaLN(x, spk_for_adaln)
                         x = layer.norm3(x + layer.ff(x))
                 
                 if cfg_scale != 1.0:
@@ -358,7 +375,8 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                 with self.dep_transformer.streaming(current_batch_size):
                     for k in range(self.n_q):
                         if k < curr_n_q:
-                            dep_input = self.dep_in[k](t_in_base) if k == 0 or prev_tok is None else self.dep_in[k](t_in_base) + self.dep_emb[k-1](prev_tok)
+                            level_ctx = torch.cat([t_in_base, self.dep_level_emb[:, k:k+1, :].expand(t_in_base.shape[0], -1, -1)], dim=-1)
+                            dep_input = self.dep_in[k](level_ctx) if k == 0 or prev_tok is None else self.dep_in[k](level_ctx) + self.dep_emb[k-1](prev_tok)
                             l = self.dep_layers[k](self.dep_transformer(dep_input)) / max(temp, 1e-6)
                             # Use the model's card + 3 as the vocabulary size for the view
                             l = l.view(current_batch_size, self.card + 3)
@@ -372,9 +390,9 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                                 sorted_indices_to_remove = cumulative_probs > top_p
                                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                                 sorted_indices_to_remove[..., 0] = 0
-                                for b_idx in range(current_batch_size):
-                                    indices_to_remove = sorted_indices[b_idx][sorted_indices_to_remove[b_idx]]
-                                    l[b_idx, indices_to_remove] = -float('inf')
+                                remove_mask = torch.zeros_like(l)
+                                remove_mask.scatter_(1, sorted_indices, sorted_indices_to_remove.to(l.dtype))
+                                l[remove_mask.bool()] = float('-inf')
                             next_tok = torch.multinomial(F.softmax(l, dim=-1), 1)
                             step_toks.append(next_tok)
                             prev_tok = next_tok

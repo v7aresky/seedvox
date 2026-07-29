@@ -67,7 +67,7 @@ class PhoneticPlanner(nn.Module):
             return self.sample(text_feat, text_mask)
 
     @torch.no_grad()
-    def sample(self, text_feat, text_mask=None, max_len=512, temp=1.0, top_p=0.9):
+    def sample(self, text_feat, text_mask=None, max_len=512, temp=1.0, top_p=0.9, greedy=False):
         B, T_text, _ = text_feat.shape
         device = text_feat.device
         
@@ -87,25 +87,28 @@ class PhoneticPlanner(nn.Module):
                 # Transformer call with 1 token + streaming state
                 logits = self.head(self.norm(self.transformer(ph_emb)))
                 last_logits = logits[:, -1, :] / max(temp, 1e-6)
-                
-                # Sample
-                probs = F.softmax(last_logits, dim=-1)
-                # Apply top_p if needed
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(last_logits, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-                    
-                    # Vectorized removal of logits to avoid CPU-GPU syncs in AR loop
-                    mask_to_remove = torch.zeros_like(last_logits, dtype=torch.bool).scatter_(
-                        dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-                    )
-                    last_logits.masked_fill_(mask_to_remove, -float('inf'))
-                    probs = F.softmax(last_logits, dim=-1)
 
-                next_tok = torch.multinomial(probs, 1)
+                if greedy:
+                    next_tok = last_logits.argmax(dim=-1, keepdim=True)
+                else:
+                    # Sample
+                    probs = F.softmax(last_logits, dim=-1)
+                    # Apply top_p if needed
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(last_logits, descending=True)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        # Vectorized removal of logits to avoid CPU-GPU syncs in AR loop
+                        mask_to_remove = torch.zeros_like(last_logits, dtype=torch.bool).scatter_(
+                            dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+                        )
+                        last_logits.masked_fill_(mask_to_remove, -float('inf'))
+                        probs = F.softmax(last_logits, dim=-1)
+
+                    next_tok = torch.multinomial(probs, 1)
                 
                 generated.append(next_tok)
                 curr_tok = next_tok

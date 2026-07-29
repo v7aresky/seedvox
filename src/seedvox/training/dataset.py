@@ -5,15 +5,21 @@ import random
 from torch.utils.data import Dataset, Sampler
 
 class TokenizedSpeechDataset(Dataset):
-    def __init__(self, token_paths, tokenizer):
+    def __init__(self, token_paths, tokenizer, return_wav=False):
         if isinstance(token_paths, str): token_paths = [token_paths]
         self.data = []
+        self.return_wav = return_wav
         for p in token_paths:
             if os.path.exists(p):
                 raw = torch.load(p, weights_only=False, map_location='cpu')
                 if isinstance(raw, dict) and 'data' in raw: self.data.extend(raw['data'])
                 elif isinstance(raw, list): self.data.extend(raw)
         self.tokenizer = tokenizer
+        if return_wav:
+            before = len(self.data)
+            self.data = [d for d in self.data if d.get('wav') is not None]
+            if before != len(self.data):
+                print(f"Filtered dataset: {before} -> {len(self.data)} (dropped {before - len(self.data)} items without wav)")
         # Pre-calculate lengths to avoid calling it in Sampler
         from tqdm import tqdm
         self.lengths = []
@@ -33,7 +39,17 @@ class TokenizedSpeechDataset(Dataset):
             # Ensure it is a tensor
             if not isinstance(ph_ids, torch.Tensor):
                 ph_ids = torch.tensor(ph_ids, dtype=torch.long)
-        return text_ids, audio_tokens, norm_text, ph_ids
+
+        wav = None
+        if self.return_wav:
+            wav = item.get('wav', None)
+            if wav is None and 'wav_path' in item:
+                import torchaudio
+                wav, _ = torchaudio.load(item['wav_path'])
+            if wav is not None:
+                wav = wav.squeeze(0)  # [1, T] -> [T]
+
+        return text_ids, audio_tokens, norm_text, ph_ids, wav
 
 class LengthGroupedSampler(Sampler):
     def __init__(self, dataset, batch_size):
@@ -59,33 +75,32 @@ class LengthGroupedSampler(Sampler):
     def __len__(self): return len(self.indices)
 
 def collate_fn(batch):
-    text_ids, audio_tokens, raw_texts, ph_ids = zip(*batch)
-    
+    text_ids, audio_tokens, raw_texts, ph_ids, _wavs = zip(*batch)
+
     t_lens = torch.tensor([len(t) for t in text_ids], dtype=torch.long)
     t_max = ((t_lens.max().item() + 7) // 8) * 8
     padded_text = torch.full((len(text_ids), t_max), 0, dtype=torch.long)
     for i, t in enumerate(text_ids): padded_text[i, :len(t)] = t
-    
+
     # Dynamically find max K (codebooks) and max T (sequence length)
     k_max = max(a.shape[0] for a in audio_tokens)
     a_max = max(a.shape[1] for a in audio_tokens)
     a_max = ((a_max + 7) // 8) * 8
-    
+
     padded_audio = torch.zeros(len(audio_tokens), k_max, a_max, dtype=torch.long)
-    for i, a in enumerate(audio_tokens): 
+    for i, a in enumerate(audio_tokens):
         padded_audio[i, :a.shape[0], :a.shape[1]] = a
-    
+
     a_lens = torch.tensor([a.shape[1] for a in audio_tokens], dtype=torch.long)
-    
+
     # Handle ph_ids (might be None)
     padded_ph = None
     if any(p is not None for p in ph_ids):
-        # Filter out Nones for padding
         ph_list = [p if p is not None else torch.tensor([], dtype=torch.long) for p in ph_ids]
         ph_lens = torch.tensor([len(p) for p in ph_list], dtype=torch.long)
         p_max = ph_lens.max().item()
         padded_ph = torch.full((len(ph_list), p_max), 0, dtype=torch.long)
-        for i, p in enumerate(ph_list): 
+        for i, p in enumerate(ph_list):
             if len(p) > 0: padded_ph[i, :len(p)] = p
-            
+
     return padded_text, padded_audio, t_lens, a_lens, raw_texts, padded_ph

@@ -1,9 +1,5 @@
-sphn
-torch
-torchaudio
-transformers
-tqdm
+torch>=2.1.0
+torchaudio>=2.1.0
 numpy
-g2p_en
-phonemizer
-safetensors
+einops
+tqdm

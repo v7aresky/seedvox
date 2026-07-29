@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from seedvox.modules.moshi.modules.streaming import StreamingContainer
 from seedvox.modules.moshi.modules.transformer import StreamingTransformer, create_norm_fn
 from seedvox.modules.components import (
     ScaledEmbedding, TextTransformerEncoder, SpeakerEncoder, 
-    ProsodyEncoder, MonotonicAttention
+    ProsodyEncoder, MonotonicAttention, AdaLN
 )
 
 # Shared helper
@@ -31,15 +32,27 @@ class CrossAttentionDecoderLayer(nn.Module):
             nn.Linear(hs, dim), nn.Dropout(0.1)
         )
         self.norm3 = nn.LayerNorm(dim)
+        # Speaker AdaLN: directly modulate hidden states with speaker vector
+        self.speaker_adaLN = AdaLN(dim)
+        # Initialize AdaLN to identity: gamma=0, beta=0 => x * (1+0) + 0 = x
+        with torch.no_grad():
+            nn.init.zeros_(self.speaker_adaLN.mlp[1].weight)
+            nn.init.zeros_(self.speaker_adaLN.mlp[1].bias)
 
-    def forward(self, x, kv_ctx, kv_mask=None, positions=None):
+    def forward(self, x, kv_ctx, kv_mask=None, positions=None, speaker_emb=None):
         if self.pre_norm:
             x = x + self.self_attn(self.norm1(x), positions=positions)
             x = x + self.cross_attn(self.norm2(x), kv_input=kv_ctx, kv_mask=kv_mask)
+            if speaker_emb is not None:
+                spk = speaker_emb.mean(dim=1) if speaker_emb.dim() == 3 else speaker_emb
+                x = self.speaker_adaLN(x, spk)
             x = x + self.ff(self.norm3(x))
         else:
             x = self.norm1(x + self.self_attn(x, positions=positions))
             x = self.norm2(x + self.cross_attn(x, kv_input=kv_ctx, kv_mask=kv_mask))
+            if speaker_emb is not None:
+                spk = speaker_emb.mean(dim=1) if speaker_emb.dim() == 3 else speaker_emb
+                x = self.speaker_adaLN(x, spk)
             x = self.norm3(x + self.ff(x))
         return x
 
@@ -72,8 +85,13 @@ class JEPAProsodyBase(StreamingContainer):
             for _ in range(cfg['dec_num_layers'])
         ])
         
-        self.dep_in = nn.ModuleList([nn.Linear(self.dim, self.dim, bias=False) for _ in range(self.n_q)])
-        self.dep_layers = nn.ModuleList([nn.Linear(self.dim, self.card + 3) for _ in range(self.n_q)])
+        self.dep_level_emb = nn.Parameter(torch.randn(1, self.n_q, self.dim) * 0.02)
+        self.dep_in = nn.ModuleList([nn.Sequential(
+            nn.LayerNorm(self.dim * 2), nn.Linear(self.dim * 2, self.dim), nn.GELU(), nn.Linear(self.dim, self.dim)
+        ) for _ in range(self.n_q)])
+        self.dep_layers = nn.ModuleList([nn.Sequential(
+            nn.Linear(self.dim, self.dim), nn.GELU(), nn.Linear(self.dim, self.card + 3)
+        ) for _ in range(self.n_q)])
         self.dep_emb = nn.ModuleList([ScaledEmbedding(self.card + 3, self.dim, zero_idx=-1) for _ in range(self.n_q - 1)])
         self.dep_transformer = StreamingTransformer(
             self.dim, self.dim // 64, cfg['depformer_num_layers'],
@@ -85,28 +103,30 @@ class JEPAProsodyBase(StreamingContainer):
             nn.Linear(self.dim, self.dim),
         )
         self.cfg = cfg
+        self.use_grad_ckpt = cfg.get('gradient_checkpointing', False)
 
     def encode_text(self, text, text_lens, raw_texts=None):
-        B, device = text.shape[0], text.device
-        text_in = torch.zeros((B, text.shape[1] + 2), device=device, dtype=torch.long)
-        for b in range(B):
-            l = text_lens[b].item()
-            text_in[b, 0], text_in[b, 1:1+l], text_in[b, 1+l] = self.SOT_ID, text[b, :l], self.EOT_ID
-        t_mask = torch.ones(B, 1, text_in.shape[1], text_in.shape[1], device=device, dtype=torch.bool)
-        for b in range(B):
-            l = text_lens[b].item() + 2
-            t_mask[b, 0, :, l:], t_mask[b, 0, l:, :] = False, False
+        B, T, device = text.shape[0], text.shape[1], text.device
+        text_in = torch.zeros((B, T + 2), device=device, dtype=torch.long)
+        text_in[:, 0] = self.SOT_ID
+        text_in[:, 1:1+T] = text
+        text_in[torch.arange(B, device=device), text_lens.long() + 1] = self.EOT_ID
+
+        T_full = T + 2
+        lens = (text_lens.long() + 2).unsqueeze(1)
+        arange = torch.arange(T_full, device=device).unsqueeze(0)
+        valid = arange < lens
+        t_mask = (valid.unsqueeze(2) & valid.unsqueeze(1)).unsqueeze(1)
         return self.text_encoder(self.text_emb(text_in), mask=t_mask), text_in
     
-    def forward_with_context(self, context, ctx_mask, audio_tokens, audio_lens):
+    def forward_with_context(self, context, ctx_mask, audio_tokens, audio_lens, speaker_emb=None):
         B, K, Ta = audio_tokens.shape
         device = audio_tokens.device
         a_in = torch.full((B, K, Ta + 1), self.SOA_ID, device=device, dtype=torch.long)
         a_in[:, :, 1:] = audio_tokens
         a_tgt = torch.full((B, K, Ta + 1), -1, device=device, dtype=torch.long)
         a_tgt[:, :, :Ta] = audio_tokens
-        for b in range(B):
-            a_tgt[b, :, audio_lens[b]] = self.EOA_ID
+        a_tgt[torch.arange(B, device=device), :, audio_lens] = self.EOA_ID
             
         a_emb = self.audio_prenet(self.audio_norm(
             _sum_embeddings(self.audio_embs, a_in, K)
@@ -114,8 +134,12 @@ class JEPAProsodyBase(StreamingContainer):
         
         x = a_emb
         positions = torch.arange(a_emb.shape[1], device=device).unsqueeze(0)
-        for layer in self.decoder_layers:
-            x = layer(x, context, kv_mask=ctx_mask, positions=positions)
+        if self.use_grad_ckpt and self.training:
+            for layer in self.decoder_layers:
+                x = checkpoint(layer, x, context, ctx_mask, positions, speaker_emb, use_reentrant=False)
+        else:
+            for layer in self.decoder_layers:
+                x = layer(x, context, kv_mask=ctx_mask, positions=positions, speaker_emb=speaker_emb)
             
         T_a_in = x.shape[1]
         flat_out = x.reshape(B * T_a_in, 1, self.dim).transpose(0, 1)
@@ -123,10 +147,11 @@ class JEPAProsodyBase(StreamingContainer):
         
         dep_inputs = []
         for k in range(self.n_q):
+            level_ctx = torch.cat([flat_out, self.dep_level_emb[:, k:k+1, :].expand_as(flat_out)], dim=-1)
             if k == 0:
-                dep_inputs.append(self.dep_in[k](flat_out))
+                dep_inputs.append(self.dep_in[k](level_ctx))
             else:
-                dep_inputs.append(self.dep_in[k](flat_out) + self.dep_emb[k-1](flat_tgt[:, k-1]))
+                dep_inputs.append(self.dep_in[k](level_ctx) + self.dep_emb[k-1](flat_tgt[:, k-1]))
         
         d_out = self.dep_transformer(torch.stack(dep_inputs, 2).view(B * T_a_in, self.n_q, -1))
         logits = torch.stack([self.dep_layers[k](d_out[:, k, :]).view(B, T_a_in, self.card + 3) for k in range(self.n_q)], 0)

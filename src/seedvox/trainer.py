@@ -151,16 +151,27 @@ class SeedVoxTrainer:
             
             # Robust state_dict extraction
             state_dict = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
-            self.model.load_state_dict(state_dict, strict=True)
+            result = self.model.load_state_dict(state_dict, strict=False)
+            if result.missing_keys:
+                print(f"WARNING: Missing keys (new parameters keeping init): {result.missing_keys}")
+            if result.unexpected_keys:
+                print(f"WARNING: Unexpected keys (ignored): {result.unexpected_keys}")
             
             if 'ema_model' in ckpt:
-                self.ema_model.load_state_dict(ckpt['ema_model'])
+                self.ema_model.load_state_dict(ckpt['ema_model'], strict=False)
             
             if isinstance(ckpt, dict):
                 if 'optimizer' in ckpt:
-                    self.optimizer.load_state_dict(ckpt['optimizer'])
+                    try:
+                        self.optimizer.load_state_dict(ckpt['optimizer'])
+                    except ValueError as e:
+                        print(f"WARNING: Could not load optimizer state (param groups changed): {e}")
+                        print("Using fresh optimizer with new param groups.")
                 if 'scheduler' in ckpt:
-                    self.scheduler.load_state_dict(ckpt['scheduler'])
+                    try:
+                        self.scheduler.load_state_dict(ckpt['scheduler'])
+                    except ValueError as e:
+                        print(f"WARNING: Could not load scheduler state: {e}")
                 if 'scaler' in ckpt:
                     self.scaler.load_state_dict(ckpt['scaler'])
                 self.global_step = ckpt.get('step', 0)

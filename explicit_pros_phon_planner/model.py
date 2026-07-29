@@ -93,14 +93,16 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
     def encode_context(self, text, text_lens, audio_tokens=None, audio_lens=None, raw_texts=None, 
                        use_speaker=None, use_prosody=None, phoneme_ids=None, mimi_latents=None,
                        bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
-                       drop_prob=0.0, external_speaker=None, external_prosody=None):
+                       drop_prob=0.0, external_speaker=None, external_prosody=None,
+                       text_feat=None):
         
         # 1. Get Base Context (Speaker, Prosody, Text)
-        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss = super().encode_context(
+        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec = super().encode_context(
             text, text_lens, audio_tokens, audio_lens, raw_texts,
             use_speaker, use_prosody, phoneme_ids=None, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
-            drop_prob=drop_prob, external_speaker=external_speaker, external_prosody=external_prosody
+            drop_prob=drop_prob, external_speaker=external_speaker, external_prosody=external_prosody,
+            text_feat=text_feat
         )
         
         # 2. Extract Speaker Latents for FiLM
@@ -167,16 +169,16 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
             # 4. Txt
             new_mask[:, curr : curr + 1 + txt.shape[1]] = torch.cat([mk_marker(B, text.device), ctx_mask[:, spk_len + prs_len:]], dim=1)
             
-            return new_context, new_mask, ph_logits, jepa_loss, contrastive_loss
+            return new_context, new_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec
             
-        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss
+        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec
 
     def forward(self, text, audio_tokens, text_lens, audio_lens, raw_texts=None, 
                 use_speaker=None, use_prosody=None, phoneme_ids=None, mimi_latents=None,
                 bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
                 drop_prob=0.0):
         
-        # 1. Extract enriched text features for the phonetic planner
+        # 1. Extract enriched text features once (shared between phonetic planner and context)
         text_feat = self.get_enriched_text_feat(
             text, text_lens, raw_texts, bpe_ids, bpe_lens, char_to_bpe, char_lens
         )
@@ -194,18 +196,19 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
             ph_mask = (phoneme_ids != 0)
             ph_planner_logits = self.phonetic_planner(text_feat, phoneme_ids, text_mask=text_mask, phoneme_mask=ph_mask)
         
-        # 3. Acoustic Forward (using augmented context)
+        # 3. Acoustic Forward (using augmented context, reuse text_feat)
         if audio_tokens is not None:
             audio_tokens = audio_tokens[:, :self.n_q]
             
-        context, ctx_mask, _, jepa_loss, _ = self.encode_context(
+        context, ctx_mask, _, jepa_loss, _, spk_vec = self.encode_context(
             text, text_lens, audio_tokens, audio_lens, raw_texts, 
             use_speaker, use_prosody, phoneme_ids, mimi_latents=mimi_latents,
-            bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
-            drop_prob=drop_prob
+            bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
+            drop_prob=drop_prob,
+            text_feat=text_feat
         )
         
-        logits, targets, latent_pred = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens)
+        logits, targets, latent_pred = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens, speaker_emb=spk_vec)
         
         return logits, targets, ph_planner_logits, jepa_loss, None, latent_pred
 
@@ -213,22 +216,33 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
     def sample(self, text, text_lens, ref_audio=None, ref_lens=None, max_steps=1000, temp=0.1, curr_n_q=None, raw_texts=None, top_k=0, top_p=0.9, use_speaker=None, use_prosody=None, cfg_scale=1.0,
                bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None, phoneme_ids=None, drop_prob=0.0,
                external_speaker=None, external_prosody=None,
-               precomputed_context=None, precomputed_mask=None):
+               precomputed_context=None, precomputed_mask=None,
+               spk_vec=None):
         
         # Calculate CFG offset for [M_spk, Spk, M_prs, Prs, M_phn, Phn, M_txt, Txt]
         spk_len = self.cfg['num_speaker_latents'] if (use_speaker if use_speaker is not None else self.use_speaker) else 0
         prs_len = self.cfg.get('num_prosody_tokens', 32)
         
         if phoneme_ids is not None:
-            # Offset = 1 (M_spk) + spk_len + 1 (M_prs) + prs_len = 2 + spk_len + prs_len
             offset = 2 + spk_len + prs_len
         else:
             offset = spk_len + prs_len
+
+        # Encode context ourselves to capture spk_vec for speaker AdaLN
+        if precomputed_context is None:
+            context, ctx_mask, _, _, _, spk_vec = self.encode_context(
+                text, text_lens, audio_tokens=ref_audio, audio_lens=ref_lens,
+                raw_texts=raw_texts, use_speaker=use_speaker, use_prosody=use_prosody,
+                bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
+                phoneme_ids=phoneme_ids, drop_prob=drop_prob,
+                external_speaker=external_speaker, external_prosody=external_prosody
+            )
+            precomputed_context, precomputed_mask = context, ctx_mask
 
         return super().sample(
             text, text_lens, ref_audio, ref_lens, max_steps, temp, curr_n_q, raw_texts, top_k, top_p, use_speaker, use_prosody, cfg_scale,
             bpe_ids, bpe_lens, char_to_bpe, char_lens, phoneme_ids, drop_prob,
             external_speaker, external_prosody,
             precomputed_context=precomputed_context, precomputed_mask=precomputed_mask,
-            offset=offset
+            offset=offset, spk_vec=spk_vec
         )

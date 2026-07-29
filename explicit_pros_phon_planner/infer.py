@@ -231,8 +231,9 @@ def temporal_smooth(wav, strength=0.3, kernel_size=7):
 
 
 def _sum_embeddings(emb_list, tokens, n_q):
+    num_codebooks = min(tokens.shape[1], n_q)
     ae = emb_list[0](tokens[:, 0])
-    for k in range(1, n_q):
+    for k in range(1, num_codebooks):
         ae = ae + emb_list[k](tokens[:, k])
     return ae
 
@@ -291,7 +292,8 @@ def merge_lora_weights(model_with_lora):
         elif mod_path in lora_conv1d:
             mod = lora_conv1d[mod_path]
             if param_name == 'weight':
-                merged = mod.original_conv.weight + (mod.lora_B @ mod.lora_A) * mod.scaling
+                delta_w = torch.einsum('or,rik->oik', mod.lora_B.squeeze(-1), mod.lora_A)
+                merged = mod.original_conv.weight + delta_w * mod.scaling
                 merged_sd[key] = merged.detach().cpu()
             elif param_name == 'bias':
                 merged_sd[key] = mod.bias.detach().cpu() if mod.bias is not None else clean_sd[key]
@@ -301,10 +303,8 @@ def merge_lora_weights(model_with_lora):
         elif mod_path in lora_convtr1d:
             mod = lora_convtr1d[mod_path]
             if param_name == 'weight':
-                out_c, in_c_g = mod.original_convtr.weight.shape[:2]
-                g = mod.original_convtr.groups
-                lo = (mod.lora_B @ mod.lora_A.transpose(1, 2)).transpose(0, 1).contiguous()
-                merged = mod.original_convtr.weight + lo.view_as(mod.original_convtr.weight) * mod.scaling
+                delta_w = torch.einsum('ri,rjk->ijk', mod.lora_A.squeeze(-1), mod.lora_B)
+                merged = mod.original_convtr.weight + delta_w * mod.scaling
                 merged_sd[key] = merged.detach().cpu()
             elif param_name == 'bias':
                 merged_sd[key] = mod.bias.detach().cpu() if mod.bias is not None else clean_sd[key]
@@ -457,7 +457,25 @@ def run_inference(args):
 
     # Load Mimi
     from seedvox.modules.mimi import get_mimi_model
+    from explicit_pros_phon_planner.finetune_lora_fusion import inject_lora as inject_lora_fn, MIMI_DECODER_TARGETS
     mimi = get_mimi_model(device=device, checkpoint_path=cfg.get('mimi_checkpoint', 'pretrained_models/best_mimi.pt')).eval()
+
+    # Load Mimi decoder LoRA if present in checkpoint
+    if args.lora_checkpoint and not args.no_mimi_lora:
+        raw_lora_m = torch.load(args.lora_checkpoint, map_location=device)
+        lora_sd_m = raw_lora_m.get('lora_state_dict', raw_lora_m)
+        mimi_lora_keys = {k: v for k, v in lora_sd_m.items() if k.startswith("mimi.")}
+        if mimi_lora_keys:
+            mimi_lora = {k[5:]: v for k, v in mimi_lora_keys.items()}
+            first_a_m = next(v for k, v in mimi_lora.items() if 'lora_A' in k)
+            mimi_rank = raw_lora_m.get('mimi_lora_rank', first_a_m.shape[0])
+            mimi_alpha = raw_lora_m.get('mimi_lora_alpha', mimi_rank * 2)
+            mimi = inject_lora_fn(mimi, rank=mimi_rank, alpha=mimi_alpha, targets=MIMI_DECODER_TARGETS)
+            mimi.load_state_dict(mimi_lora, strict=False)
+            print(f"\033[92m[Mimi LoRA]\033[0m Mimi decoder LoRA applied (rank={mimi_rank}, alpha={mimi_alpha}).")
+    elif args.lora_checkpoint and args.no_mimi_lora:
+        print(f"\033[93m[Mimi LoRA]\033[0m Skipped (disabled via --no_mimi_lora).")
+    mimi = mimi.to(device).eval()
     
     # 1.5 Optional Compilation
     if args.compile:
@@ -569,7 +587,10 @@ def run_inference(args):
                     t_ids, t_lens, raw_texts=[text],
                     bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe
                 )
-                ph_ids = model.phonetic_planner.sample(text_feat, temp=args.phoneme_temp, top_p=args.phoneme_top_p)
+                ph_ids = model.phonetic_planner.sample(
+                    text_feat, temp=args.phoneme_temp, top_p=args.phoneme_top_p,
+                    greedy=args.phoneme_greedy,
+                )
                 if device.type == 'cuda': torch.cuda.synchronize()
                 ph_tokenizer = PhonemeTokenizer()
                 tokens = ph_ids[0].tolist()
@@ -606,12 +627,13 @@ def run_inference(args):
                         mimi_toks = mimi.encode(wav.unsqueeze(0))
                         ae = _sum_embeddings(model.audio_embs, mimi_toks, model.n_q)
                         ae = model.audio_prenet(model.audio_norm(ae))
-                        cached_ext_spk = model.speaker_encoder(ae)
+                        mimi_t_len = mimi_toks.shape[-1]
+                        audio_mask = torch.arange(mimi_t_len, device=device).unsqueeze(0) >= torch.full((1,), mimi_t_len, device=device)
+                        cached_ext_spk = model.speaker_encoder(ae, key_padding_mask=audio_mask)
             ext_spk = cached_ext_spk
         elif args.random_speaker:
             print("Sampling random speaker...")
-            num_spk = model.cfg.get('num_speaker_latents', 16)
-            ext_spk = torch.randn(1, num_spk, model.dim, device=device)
+            ext_spk = model.null_speaker + torch.randn_like(model.null_speaker) * 0.5
 
         ext_prs = None
         if args.ref_wav_prosody:
@@ -627,24 +649,21 @@ def run_inference(args):
             ext_prs = cached_ext_prs
         elif args.random_prosody:
             print("Sampling random prosody...")
-            num_prs = model.cfg.get('num_prosody_tokens', 32)
-            ext_prs = torch.randn(1, num_prs, model.dim, device=device)
+            ext_prs = model.null_prosody + torch.randn_like(model.null_prosody) * 0.3
 
         # Auto-generate random embeddings for the varied axis if not already set
         if args.variant_axis == 'speaker' and ext_spk is None:
             print("Sampling random speaker (variant axis)...")
-            num_spk = model.cfg.get('num_speaker_latents', 16)
-            ext_spk = torch.randn(1, num_spk, model.dim, device=device)
+            ext_spk = model.null_speaker + torch.randn_like(model.null_speaker) * 0.5
         if args.variant_axis == 'pros' and ext_prs is None:
             print("Sampling random prosody (variant axis)...")
-            num_prs = model.cfg.get('num_prosody_tokens', 32)
-            ext_prs = torch.randn(1, num_prs, model.dim, device=device)
+            ext_prs = model.null_prosody + torch.randn_like(model.null_prosody) * 0.3
 
         # Explicit Context Encoding (Timing Prosody Planning)
         print("Encoding context and planning prosody...")
         with torch.no_grad():
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                context, ctx_mask, _, _, _ = model.encode_context(
+                context, ctx_mask, _, _, _, spk_vec = model.encode_context(
                     t_ids, t_lens, raw_texts=[text], 
                     phoneme_ids=ph_ids,
                     bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
@@ -671,7 +690,8 @@ def run_inference(args):
                     external_speaker=ext_spk,
                     external_prosody=ext_prs,
                     precomputed_context=context,
-                    precomputed_mask=ctx_mask
+                    precomputed_mask=ctx_mask,
+                    spk_vec=spk_vec
                 )
             if device.type == 'cuda': torch.cuda.synchronize()
             metrics['acoustic_gen_ms'] = (time.time() - ac_start) * 1000
@@ -679,7 +699,7 @@ def run_inference(args):
             if args.variant_n <= 1:
                 print("Extracting prosody embeddings for viz...")
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                    context, _, _, _, _ = model.encode_context(
+                    context, _, _, _, _, _ = model.encode_context(
                         t_ids, t_lens, audio_tokens, None, [text], 
                         phoneme_ids=ph_ids,
                         bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
@@ -695,6 +715,10 @@ def run_inference(args):
         # 6. Decode with Mimi
         dec_start = time.time()
         with torch.no_grad():
+            # Truncate at EOA token before decoding
+            eoa_positions = (audio_tokens[:, 0, :] == model.EOA_ID).int().argmax(dim=-1)
+            if eoa_positions.max() > 0:
+                audio_tokens = audio_tokens[:, :, :eoa_positions.max()]
             wav = mimi.decode(audio_tokens.clamp(0, model.card - 1))
             # Trim to expected length: T frames at 12.5Hz → T * 24000/12.5 = T*1920 samples
             expected_len = audio_tokens.shape[-1] * 1920
@@ -785,6 +809,8 @@ if __name__ == "__main__":
     # Phoneme sampling
     parser.add_argument("--phoneme_temp", type=float, default=1.0)
     parser.add_argument("--phoneme_top_p", type=float, default=0.9)
+    parser.add_argument("--phoneme_greedy", action="store_true",
+                        help="Deterministic argmax decoding for phonemes (eliminates prosody variance)")
 
     # Visualization and playback
     parser.add_argument("--play", action="store_true", help="Play audio after generation")
@@ -814,6 +840,7 @@ if __name__ == "__main__":
     parser.add_argument("--lora_checkpoint", type=str, default=None, help="LoRA adapter weights to apply on top of base checkpoint")
     parser.add_argument("--lora_rank", type=int, default=None, help="LoRA rank (auto-detected from checkpoint if not set)")
     parser.add_argument("--lora_alpha", type=int, default=None, help="LoRA alpha (auto-detected from checkpoint if not set)")
+    parser.add_argument("--no_mimi_lora", action="store_true", help="Skip applying Mimi decoder LoRA (useful if it causes distortion)")
     parser.add_argument("--save_merged_checkpoint", type=str, default=None,
                         help="Save a full model checkpoint with LoRA weights permanently merged (requires --lora_checkpoint)")
 

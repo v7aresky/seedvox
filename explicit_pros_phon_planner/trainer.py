@@ -18,33 +18,30 @@ class ExplicitCollate:
     def __call__(self, batch):
         self.total_batches += 1
         # 1. Base Collate (Pads audio/text)
-        # raw_texts is now the normalized text from Dataset.__getitem__
         padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds = collate_fn(batch)
-        
+
         # 2. Use precomputed phonemes if available
         if ph_ids_from_ds is not None:
              return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds
 
         # 3. Parallel G2P (Fallback)
         try:
-            # Note: raw_texts is already normalized, so we pass normalize=False
             ph_target_list = self.ph_generator.generate_targets_batch(raw_texts, normalize=False)
             ph_targets = collate_phonemes(ph_target_list)
         except Exception as e:
             self.failure_count += 1
             failure_rate = self.failure_count / self.total_batches
             print(f"Error in Parallel G2P worker: {e}. Failure rate: {failure_rate:.2%}")
-            
+
             if failure_rate > self.failure_threshold:
                 raise RuntimeError(f"G2P failure rate exceeded threshold!")
 
             try:
-                # Direct fallback (sequential if batch fails)
                 ph_target_list = [self.ph_generator.generate_targets(text, normalize=False) for text in raw_texts]
                 ph_targets = collate_phonemes(ph_target_list)
             except Exception as e2:
                 ph_targets = torch.zeros((len(raw_texts), 2), dtype=torch.long)
-        
+
         return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets
 
 class ExplicitTrainer(SeedVoxTrainer):

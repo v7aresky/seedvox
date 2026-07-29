@@ -39,7 +39,8 @@ class FusionPlannerModel(ExplicitPlannerModel):
     def encode_context(self, text, text_lens, audio_tokens=None, audio_lens=None, raw_texts=None, 
                        use_speaker=None, use_prosody=None, phoneme_ids=None, mimi_latents=None,
                        bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
-                       drop_prob=0.0, external_speaker=None, external_prosody=None):
+                       drop_prob=0.0, external_speaker=None, external_prosody=None,
+                       text_feat=None):
         
         # 1. Get Base Context from ExplicitPlannerModel (which calls JEPAProsodyHybridModel)
         # We call super(ExplicitPlannerModel, self) to get the standard JEPA context 
@@ -48,11 +49,12 @@ class FusionPlannerModel(ExplicitPlannerModel):
         # Let's get the standard context first.
         
         from seedvox.model import JEPAProsodyHybridModel
-        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss = JEPAProsodyHybridModel.encode_context(
+        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec = JEPAProsodyHybridModel.encode_context(
             self, text, text_lens, audio_tokens, audio_lens, raw_texts,
             use_speaker, use_prosody, phoneme_ids=None, mimi_latents=mimi_latents,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
-            drop_prob=drop_prob, external_speaker=external_speaker, external_prosody=external_prosody
+            drop_prob=drop_prob, external_speaker=external_speaker, external_prosody=external_prosody,
+            text_feat=text_feat
         )
         
         # 2. Extract Speaker Latents for FiLM (consistent with ExplicitPlannerModel)
@@ -106,20 +108,21 @@ class FusionPlannerModel(ExplicitPlannerModel):
             curr += 1 + prs_len
             new_mask[:, curr : curr + 1 + txt.shape[1]] = torch.cat([mk_marker(B, text.device), ctx_mask[:, spk_len + prs_len:]], dim=1)
             
-            return new_context, new_mask, ph_logits, jepa_loss, contrastive_loss
+            return new_context, new_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec
             
-        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss
+        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec
 
     @torch.no_grad()
     def sample(self, text, text_lens, ref_audio=None, ref_lens=None, max_steps=1000, temp=0.1, curr_n_q=None, raw_texts=None, top_k=0, top_p=0.9, use_speaker=None, use_prosody=None, cfg_scale=1.0,
                bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None, phoneme_ids=None, drop_prob=0.0,
                external_speaker=None, external_prosody=None,
-               precomputed_context=None, precomputed_mask=None):
+               precomputed_context=None, precomputed_mask=None,
+               spk_vec=None):
         """
         Overrides sample to handle correct CFG offsets for the Fusion context structure.
         """
         if precomputed_context is None:
-            context, ctx_mask, _, _, _ = self.encode_context(
+            context, ctx_mask, _, _, _, spk_vec = self.encode_context(
                 text, text_lens, audio_tokens=ref_audio, audio_lens=ref_lens, 
                 raw_texts=raw_texts, use_speaker=use_speaker, use_prosody=use_prosody,
                 bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
@@ -147,5 +150,5 @@ class FusionPlannerModel(ExplicitPlannerModel):
             bpe_ids, bpe_lens, char_to_bpe, char_lens, phoneme_ids, drop_prob,
             external_speaker, external_prosody,
             precomputed_context=context, precomputed_mask=ctx_mask,
-            offset=offset
+            offset=offset, spk_vec=spk_vec
         )

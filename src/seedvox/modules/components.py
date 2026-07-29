@@ -115,7 +115,12 @@ class MonotonicAttention(nn.Module):
                     if kv_mask is not None: attn = attn.masked_fill(kv_mask.view(B, 1, 1, -1), float('-inf'))
                     out = F.softmax(attn, dim=-1) @ v
                 else:
-                    out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+                    if kv_mask is not None:
+                        attn_mask = torch.zeros(B, 1, 1, kv_mask.shape[1], device=kv_mask.device, dtype=q.dtype)
+                        attn_mask.masked_fill_(kv_mask.view(B, 1, 1, -1), float('-inf'))
+                    if mono_bias is not None:
+                        attn_mask = mono_bias.unsqueeze(1) if attn_mask is None else attn_mask + mono_bias.unsqueeze(1)
+                    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
             else:
                 out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
         else:
