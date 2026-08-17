@@ -92,6 +92,114 @@ Instead of one giant network juggling everything at once, SeedVox **combines an 
 - **AR LLM** — handles sequential token generation across text, phonemes, and audio. The JEPA's expression latent guides audio generation.
 - **Frozen Prosody Teacher** — a codec trained from expressive speech that supervises the JEPA planner.
 
+### High-level view
+
+```mermaid
+graph TD
+    TXT["Input text"]
+
+    subgraph CORE["SeedVox — generation path"]
+        subgraph JEPA["JEPA World Model"]
+            J["JEPA Prosody Planner<br/>reads the full sentence, predicts a global<br/>prosody latent (B, 32, dim)"]
+        end
+
+        subgraph AR["AR Backbone"]
+            A["AR Phonetic Planner<br/>text → phonemes<br/>(what is said)"]
+            B["AR Acoustic Decoder<br/>phonemes → audio tokens<br/>(the voice)"]
+            A --> B
+        end
+
+        J -.->|"prosody latent<br/>guides generation"| B
+    end
+
+    subgraph TRAIN["Training only"]
+        T["Frozen Prosody Codec<br/>(F0 / Energy / Voicing → latent)<br/>supervises the JEPA planner"]
+    end
+
+    TXT --> A
+    VOI["Reference audio<br/>(optional)"] -.->|"speaker identity"| B
+    T -.->|"trains"| J
+    B --> OUT["Speech audio"]
+
+    style CORE fill:#ebfbee,stroke:#2f9e44
+    style JEPA fill:#e6fcf5,stroke:#0ca678
+    style AR fill:#ebfbee,stroke:#2f9e44
+    style TRAIN fill:#fff4e6,stroke:#e8590c
+```
+
+### Detailed pipeline
+
+```mermaid
+graph TD
+    subgraph INPUT["Input"]
+        Text["Input text"]
+        RefAudio["Reference audio<br/>(optional)"]
+    end
+
+    subgraph ENCODING["Text encoding"]
+        Text -->|"char tokenizer"| CT["Char IDs"]
+        Text -->|"BPE tokenizer"| BT["BPE IDs"]
+        CT -->|"text encoder"| TE["Text features<br/>(B, T_text, dim)"]
+        BT -->|"BPE + expand"| BE["BPE features"]
+        BE -->|"gated add"| TE
+    end
+
+    subgraph SPEAKER["Speaker conditioning"]
+        RefAudio -->|"speaker encoder"| SPK["Speaker latents<br/>(B, 16, dim)"]
+        SPK -->|"mean pool"| SL["Speaker vector<br/>(B, dim)"]
+    end
+
+    subgraph JEPA["JEPA Prosody Planner"]
+        TE -->|"full sentence"| PL["Predicted prosody latent<br/>(B, 32, dim)"]
+        PL -->|"exagg dial<br/>(inference)"| FPRS["Modulated prosody latent"]
+    end
+
+    subgraph PHONEMES["Phonetic planner"]
+        TE -->|"AR phoneme predictor"| PH["Phoneme IDs<br/>(B, T_ph)"]
+        PH -->|"embed + project"| PHE["Phoneme features<br/>(B, T_ph, dim)"]
+        PHE -->|"FiLM (speaker-modulated)"| FPH["Modulated phonemes"]
+        SL -.->|"speaker FiLM"| FPH
+    end
+
+    subgraph FUSION["Linguistic fusion"]
+        TE -->|"gated cross-attn"| LF["LinguisticFusion"]
+        FPH --> LF
+        LF -->|"gated residual"| UT["Unified text<br/>(B, T_text, dim)"]
+    end
+
+    subgraph DECODER["Acoustic decoder"]
+        UT -->|"context"| DEC["AR Acoustic Decoder<br/>cross-attn + speaker AdaLN"]
+        SPK -.->|"speaker AdaLN"| DEC
+        FPRS -.->|"prosody context"| DEC
+        DEC -->|"hidden state"| HID["Decoder hidden<br/>(B, T_audio, dim)"]
+        HID -->|"depformer (NAR)"| DEPM["Depformer<br/>streaming transformer"]
+        SPK -.->|"dep speaker AdaLN"| DEPM
+        FPRS -.->|"dep prosody AdaLN<br/>(mean-pooled)"| DEPM
+        DEPM -->|"RVQ logits"| RVT["RVQ audio tokens<br/>(B, 16, T_audio)"]
+        RVT -->|"Mimi decoder"| WAV["Audio waveform"]
+    end
+
+    subgraph TRAIN_ONLY["Training only — frozen teacher"]
+        WavRef["Reference waveform"] -->|"pyin extraction"| PF["Prosody features<br/>(F0 / E / V)"]
+        PF -->|"frozen ProsodyCodec"| GT["GT prosody latent<br/>(B, 32, dim)"]
+        GT -.->|"cosine loss"| PL
+        GT -.->|"teacher-forced (85% GT)"| FPRS
+    end
+
+    style CORE fill:#ebfbee,stroke:#2f9e44
+    style JEPA fill:#e6fcf5,stroke:#0ca678
+    style AR fill:#ebfbee,stroke:#2f9e44
+    style TRAIN_ONLY fill:#fff4e6,stroke:#e8590c
+    style ENCODING fill:#f8f9fa,stroke:#dee2e6
+    style SPEAKER fill:#f8f9fa,stroke:#dee2e6
+    style PHONEMES fill:#f8f9fa,stroke:#dee2e6
+    style FUSION fill:#f8f9fa,stroke:#dee2e6
+    style DECODER fill:#e7f5ff,stroke:#1971c2
+    style INPUT fill:#f8f9fa,stroke:#dee2e6
+```
+
+**Legend:** solid arrows = data flow; dashed arrows = conditioning, supervision, or training-only paths. 🟢 generation path (train + inference). 🟠 frozen teacher (training only). 🔵 decoder + depformer.
+
 ### Key design choices
 
 - **JEPA prosody planning:** Prosody is a global state of mind, not a token-level dice roll. The planner emits a learned `(B, 32, dim)` latent that shapes the entire utterance before generation begins.
