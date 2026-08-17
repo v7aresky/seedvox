@@ -353,7 +353,8 @@ class FusionLoRATrainer:
         collate = ExplicitCollate(self.ph_generator)
         self.loader = DataLoader(
             train_ds, batch_size=self.cfg['training']['batch_size'],
-            sampler=LengthGroupedSampler(train_ds, self.cfg['training']['batch_size']),
+            sampler=LengthGroupedSampler(train_ds, self.cfg['training']['batch_size'],
+                                         max_len=self.cfg['training'].get('max_audio_len_tokens', None)),
             collate_fn=collate, pin_memory=True,
             num_workers=num_workers if num_workers is not None else self.cfg['training'].get('num_workers', 4)
         )
@@ -481,9 +482,18 @@ class FusionLoRATrainer:
 
         loss_jepa = jepa_loss if jepa_loss is not None else torch.tensor(0.0, device=self.device)
 
+        # Style loss (CE between the text->style head and the GT style cluster id),
+        # stashed by the model during forward().
+        loss_style = torch.tensor(0.0, device=self.device)
+        style_logits = getattr(self.model, '_last_style_logits', None)
+        gt_style_ids = getattr(self.model, '_last_gt_style_ids', None)
+        if style_logits is not None and gt_style_ids is not None:
+            loss_style = self.criterion(style_logits.view(-1, style_logits.shape[-1]), gt_style_ids.reshape(-1))
+
         total_loss = (loss_ar +
                       self.cfg['training'].get('ph_planner_weight', 1.0) * loss_ph_planner +
-                      self.cfg['training'].get('jepa_weight', 2.0) * loss_jepa)
+                      self.cfg['training'].get('jepa_weight', 2.0) * loss_jepa +
+                      self.cfg['training'].get('style_weight', 0.1) * loss_style)
 
         # Mimi decoder reconstruction loss (BigVGAN-style)
         loss_recon = torch.tensor(0.0, device=self.device)

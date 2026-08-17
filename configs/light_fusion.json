@@ -30,22 +30,35 @@
       "use_pretrained_embeddings": true,
       "freeze_bpe_embeddings": false,
       "combination": "add"
-    }
+    },
+    "use_style": false,
+    "num_style_tokens": 16,
+    "style_drop": 0.2,
+    "style_gt_prob": 0.85,
+    "use_dep_style_cond": true
   },
   "training": {
     "batch_size": 12,
     "num_workers": 0,
-    "ph_planner_weight": 0.5, 
-    "lr": 5e-5,
+    "ph_planner_weight": 0.5,
+    "lr": 5e-05,
     "ph_pretrain_path": "pretrained_models/phonetic_head_pretrain.pt",
     "param_groups": [
       {
-        "keywords": ["text_emb", "text_encoder"],
-        "lr": 1e-5
+        "keywords": [
+          "text_emb",
+          "text_encoder"
+        ],
+        "lr": 1e-05
       },
       {
-        "keywords": ["phonetic_planner","ph_decoder_emb", "film_phn", "film_prs"],
-        "lr": 1e-5
+        "keywords": [
+          "phonetic_planner",
+          "ph_decoder_emb",
+          "film_phn",
+          "film_prs"
+        ],
+        "lr": 1e-05
       }
     ],
     "warmup_steps": 2000,
@@ -67,6 +80,7 @@
       "enabled": true,
       "start_codebooks": 4,
       "ramp_steps": 50000
-    }
+    },
+    "style_weight": 0.1
   }
 }

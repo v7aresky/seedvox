@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--ref_prosody", type=str, default=None)
     parser.add_argument("--random_speaker", action="store_true")
     parser.add_argument("--random_prosody", action="store_true")
+    parser.add_argument("--style", type=int, default=None, help="Explicit style token id (0..num_style_tokens-1). Defaults to the text->style head prediction.")
     parser.add_argument("--ablation_mode", type=str, default="full", choices=["full", "null", "oracle"])
     parser.add_argument("--output", type=str, default="output.wav")
     parser.add_argument("--cfg_scale", type=float, default=1.0)
@@ -98,7 +99,8 @@ def main():
             ref_audio=ref_audio, ref_lens=ref_len,
             cfg_scale=args.cfg_scale, temp=args.temp, 
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
-            phoneme_ids=torch.tensor([ph_ids], device=device)
+            phoneme_ids=torch.tensor([ph_ids], device=device),
+            external_style=args.style
         )
     
     audio = mimi.decode(gen)[0].cpu()

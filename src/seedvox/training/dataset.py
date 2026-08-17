@@ -49,10 +49,16 @@ class TokenizedSpeechDataset(Dataset):
             if wav is not None:
                 wav = wav.squeeze(0)  # [1, T] -> [T]
 
-        return text_ids, audio_tokens, norm_text, ph_ids, wav
+        # Prosody features (stage-1 codec input): [T, 3] (log_f0_center, e_center, voicing)
+        prosody_feat = None
+        if all(k in item for k in ('log_f0_center', 'e_center', 'voicing')):
+            prosody_feat = torch.stack(
+                [item['log_f0_center'], item['e_center'], item['voicing'].float()], dim=-1)
+
+        return text_ids, audio_tokens, norm_text, ph_ids, wav, prosody_feat
 
 class LengthGroupedSampler(Sampler):
-    def __init__(self, dataset, batch_size):
+    def __init__(self, dataset, batch_size, max_len=None):
         self.dataset, self.batch_size = dataset, batch_size
         self.indices = list(range(len(dataset)))
         if hasattr(dataset, 'lengths'):
@@ -63,6 +69,12 @@ class LengthGroupedSampler(Sampler):
         else:
             print("Warning: Dataset does not have pre-calculated lengths. This may be slow.")
             self.lengths = [item[1].shape[-1] for item in dataset]
+        if max_len is not None:
+            before = len(self.indices)
+            self.indices = [i for i in self.indices if self.lengths[i] <= max_len]
+            dropped = before - len(self.indices)
+            if dropped:
+                print(f"LengthGroupedSampler: pruned {dropped} samples (audio_tokens > {max_len}) -> {len(self.indices)} remain")
     def __iter__(self):
         # Reduced noise factor from 0.1 to 0.02 for more stable length grouping
         indices_with_lengths = [(i, self.lengths[i] + self.lengths[i] * 0.02 * (random.random() - 0.5)) for i in self.indices]
@@ -74,8 +86,8 @@ class LengthGroupedSampler(Sampler):
             for idx in b: yield idx
     def __len__(self): return len(self.indices)
 
-def collate_fn(batch):
-    text_ids, audio_tokens, raw_texts, ph_ids, _wavs = zip(*batch)
+def _collate(batch, return_feats):
+    text_ids, audio_tokens, raw_texts, ph_ids, _wavs, feats = zip(*batch)
 
     t_lens = torch.tensor([len(t) for t in text_ids], dtype=torch.long)
     t_max = ((t_lens.max().item() + 7) // 8) * 8
@@ -93,9 +105,11 @@ def collate_fn(batch):
 
     a_lens = torch.tensor([a.shape[1] for a in audio_tokens], dtype=torch.long)
 
-    # Handle ph_ids (might be None)
+    # Handle ph_ids (might be None). Use stored phonemes ONLY if every item has them;
+    # otherwise return None so callers regenerate G2P for the whole batch (mixing
+    # datasets with and without ph_ids would otherwise leave zero rows that NaN the model).
     padded_ph = None
-    if any(p is not None for p in ph_ids):
+    if all(p is not None for p in ph_ids):
         ph_list = [p if p is not None else torch.tensor([], dtype=torch.long) for p in ph_ids]
         ph_lens = torch.tensor([len(p) for p in ph_list], dtype=torch.long)
         p_max = ph_lens.max().item()
@@ -103,4 +117,26 @@ def collate_fn(batch):
         for i, p in enumerate(ph_list):
             if len(p) > 0: padded_ph[i, :len(p)] = p
 
-    return padded_text, padded_audio, t_lens, a_lens, raw_texts, padded_ph
+    base = (padded_text, padded_audio, t_lens, a_lens, raw_texts, padded_ph)
+
+    if not return_feats:
+        return base
+
+    # Prosody features padded to a multiple of num_blocks (32) so the codec's
+    # adaptive pool bins are consistent with stage-1 training.
+    if all(f is not None for f in feats):
+        a_pros = ((a_max + 31) // 32) * 32
+        padded_feat = torch.zeros(len(feats), a_pros, 3)
+        for i, f in enumerate(feats):
+            n = min(f.shape[0], a_pros)
+            padded_feat[i, :n] = f[:n]
+    else:
+        padded_feat = None
+
+    return base + (padded_feat,)
+
+def collate_fn(batch):
+    return _collate(batch, return_feats=False)
+
+def collate_fn_prosody(batch):
+    return _collate(batch, return_feats=True)

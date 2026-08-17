@@ -21,7 +21,7 @@ from explicit_pros_phon_planner.model_fusion import FusionPlannerModel
 from explicit_pros_phon_planner.finetune_lora_fusion import inject_lora, LoRALinear, LoRAConv1d, LoRAConvTranspose1d
 
 from seedvox.utils.tokenizer import CharTokenizer, PhonemeTokenizer
-from explicit_pros_phon_planner.utils import PhoneticGenerator, collate_phonemes
+from explicit_pros_phon_planner.utils import PhoneticGenerator, collate_phonemes, filter_state_dict, extract_ref_prosody_latent
 
 def get_braille_char(dots):
     """
@@ -403,6 +403,7 @@ def run_inference(args):
             else:
                 print(f"@@@@ Loading model weights from {args.checkpoint}...")
             state_dict = ckpt
+        state_dict = filter_state_dict(model, state_dict)
         model.load_state_dict(state_dict, strict=False)
 
     if args.refiner_checkpoint:
@@ -638,18 +639,16 @@ def run_inference(args):
         ext_prs = None
         if args.ref_wav_prosody:
             if cached_ext_prs is None:
-                print(f"Extracting prosody from {args.ref_wav_prosody}...")
-                wav = load_audio(args.ref_wav_prosody, device)
-                with torch.no_grad():
-                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                        mimi_toks = mimi.encode(wav.unsqueeze(0))
-                        ae = _sum_embeddings(model.audio_embs, mimi_toks, model.n_q)
-                        ae = model.audio_prenet(model.audio_norm(ae))
-                        cached_ext_prs = model.prosody_encoder(ae)
+                print(f"Extracting prosody from {args.ref_wav_prosody} (stage-1 codec)...")
+                cached_ext_prs = extract_ref_prosody_latent(args.ref_wav_prosody, model, device)
             ext_prs = cached_ext_prs
         elif args.random_prosody:
             print("Sampling random prosody...")
             ext_prs = model.null_prosody + torch.randn_like(model.null_prosody) * 0.3
+
+        style_id = args.style
+        if style_id is not None:
+            print(f"Style: {style_id}")
 
         # Auto-generate random embeddings for the varied axis if not already set
         if args.variant_axis == 'speaker' and ext_spk is None:
@@ -663,12 +662,15 @@ def run_inference(args):
         print("Encoding context and planning prosody...")
         with torch.no_grad():
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                context, ctx_mask, _, _, _, spk_vec = model.encode_context(
+                context, ctx_mask, _, _, _, spk_vec, prosody_emb = model.encode_context(
                     t_ids, t_lens, raw_texts=[text], 
                     phoneme_ids=ph_ids,
                     bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
                     external_speaker=ext_spk,
-                    external_prosody=ext_prs
+                    external_prosody=ext_prs,
+                    external_style=style_id,
+                    exagg=args.exagg,
+                    prosody_temperature=args.prosody_temperature
                 )
 
         if device.type == 'cuda': torch.cuda.synchronize()
@@ -691,7 +693,13 @@ def run_inference(args):
                     external_prosody=ext_prs,
                     precomputed_context=context,
                     precomputed_mask=ctx_mask,
-                    spk_vec=spk_vec
+                    spk_vec=spk_vec,
+                    prosody_emb=prosody_emb,
+                    min_p=args.min_p,
+                    rep_penalty=args.rep_penalty,
+                    exagg=args.exagg,
+                    mono_slack=args.mono_slack,
+                    prosody_temperature=args.prosody_temperature,
                 )
             if device.type == 'cuda': torch.cuda.synchronize()
             metrics['acoustic_gen_ms'] = (time.time() - ac_start) * 1000
@@ -699,12 +707,14 @@ def run_inference(args):
             if args.variant_n <= 1:
                 print("Extracting prosody embeddings for viz...")
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                    context, _, _, _, _, _ = model.encode_context(
+                    context, _, _, _, _, _, _ = model.encode_context(
                         t_ids, t_lens, audio_tokens, None, [text], 
                         phoneme_ids=ph_ids,
                         bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
                         external_speaker=ext_spk,
-                        external_prosody=ext_prs
+                        external_prosody=ext_prs,
+                        exagg=args.exagg,
+                        prosody_temperature=args.prosody_temperature
                     )
 
                 spk_len = model.cfg['num_speaker_latents'] if model.use_speaker else 0
@@ -719,6 +729,11 @@ def run_inference(args):
             eoa_positions = (audio_tokens[:, 0, :] == model.EOA_ID).int().argmax(dim=-1)
             if eoa_positions.max() > 0:
                 audio_tokens = audio_tokens[:, :, :eoa_positions.max()]
+            # Drop the final token frame: a degenerate noise-burst frame is
+            # reliably emitted right before EOA (preceding frame is already
+            # near-silent), which decodes to a click/buzz at the end.
+            if audio_tokens.shape[-1] > 1:
+                audio_tokens = audio_tokens[:, :, :-1]
             wav = mimi.decode(audio_tokens.clamp(0, model.card - 1))
             # Trim to expected length: T frames at 12.5Hz → T * 24000/12.5 = T*1920 samples
             expected_len = audio_tokens.shape[-1] * 1920
@@ -795,6 +810,11 @@ if __name__ == "__main__":
     parser.add_argument("--g2p", default="espeak", help="G2P backend to use with --use_external_g2p")
     parser.add_argument("--temp", type=float, default=0.1)
     parser.add_argument("--cfg", type=float, default=1.0)
+    parser.add_argument("--min_p", type=float, default=0.0, help="Min-p sampling: keep tokens with prob >= min_p * max prob (0=off)")
+    parser.add_argument("--rep_penalty", type=float, default=1.0, help="Repetition penalty on acoustic tokens (1.0=off, ~1.2 typical)")
+    parser.add_argument("--exagg", type=float, default=1.0, help="Prosody exaggeration dial (0=flat/neutral, 1=natural, >1=emphatic)")
+    parser.add_argument("--prosody_temperature", type=float, default=None, help="Stochastic prosody planner sampling temperature (None=use config prosody_temperature)")
+    parser.add_argument("--mono_slack", type=float, default=0.0, help="Monotone cross-attn window (0=off; window radius in text frames, e.g. 2)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=['fp32', 'fp16', 'bf16'], default='fp32', help="Inference precision")
     parser.add_argument("--seed", type=int, default=None, help="Fixed seed for reproducibility")
@@ -804,6 +824,8 @@ if __name__ == "__main__":
     parser.add_argument("--ref_wav_prosody", type=str, default=None)
     parser.add_argument("--random_speaker", action="store_true")
     parser.add_argument("--random_prosody", action="store_true")
+    parser.add_argument("--style", type=int, default=None,
+                        help="Explicit style token id (0..num_style_tokens-1). Defaults to the text->style head prediction.")
     parser.add_argument("--use_linguistic_fusion", action="store_true", help="Force use of FusionPlannerModel")
     
     # Phoneme sampling

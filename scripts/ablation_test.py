@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--ref_speaker", type=str, help="Wav file for voice identity")
     parser.add_argument("--ref_prosody", type=str, help="Wav file for oracle prosody transfer")
+    parser.add_argument("--style", type=int, default=None, help="Explicit style token id (0..num_style_tokens-1)")
     parser.add_argument("--output_dir", type=str, default="ablation_results")
     parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument("--temp", type=float, default=0.1)
@@ -92,7 +93,8 @@ def main():
             ref_audio=ref_audio_toks, ref_lens=ref_audio_len, 
             mimi_latents=mimi_latents_prosody,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
-            ablation_mode=mode, cfg_scale=args.cfg_scale, temp=args.temp
+            ablation_mode=mode, cfg_scale=args.cfg_scale, temp=args.temp,
+            external_style=args.style
         )
         audio = mimi.decode(gen.clamp(0, 2047))[0]
         out_path = os.path.join(args.output_dir, f"seedvox_{mode}.wav")

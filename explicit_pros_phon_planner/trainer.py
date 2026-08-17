@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from seedvox.trainer import SeedVoxTrainer
-from seedvox.training.dataset import TokenizedSpeechDataset, collate_fn, LengthGroupedSampler
+from seedvox.training.dataset import TokenizedSpeechDataset, collate_fn_prosody, LengthGroupedSampler
 from .model import ExplicitPlannerModel
 from .utils import PhoneticGenerator, collate_phonemes
 
@@ -17,12 +17,12 @@ class ExplicitCollate:
 
     def __call__(self, batch):
         self.total_batches += 1
-        # 1. Base Collate (Pads audio/text)
-        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds = collate_fn(batch)
+        # 1. Base Collate (Pads audio/text) + prosody features (codec teacher input)
+        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds, prosody_feat = collate_fn_prosody(batch)
 
         # 2. Use precomputed phonemes if available
         if ph_ids_from_ds is not None:
-             return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds
+             return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds, prosody_feat
 
         # 3. Parallel G2P (Fallback)
         try:
@@ -42,7 +42,7 @@ class ExplicitCollate:
             except Exception as e2:
                 ph_targets = torch.zeros((len(raw_texts), 2), dtype=torch.long)
 
-        return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets
+        return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, prosody_feat
 
 class ExplicitTrainer(SeedVoxTrainer):
     """
@@ -134,19 +134,22 @@ class ExplicitTrainer(SeedVoxTrainer):
         self.loader = DataLoader(
             train_ds, 
             batch_size=self.cfg['training']['batch_size'], 
-            sampler=LengthGroupedSampler(train_ds, self.cfg['training']['batch_size']), 
+            sampler=LengthGroupedSampler(train_ds, self.cfg['training']['batch_size'],
+                                         max_len=self.cfg['training'].get('max_audio_len_tokens', None)), 
             collate_fn=collate, 
             pin_memory=True, 
             num_workers=self.cfg['training'].get('num_workers', 4)
         )
 
     def _compute_loss(self, batch):
-        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets = batch
+        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, _prosody_feat = batch
         
         padded_text = padded_text.to(self.device)
         padded_audio = padded_audio.to(self.device)
         t_lens, a_lens = t_lens.to(self.device), a_lens.to(self.device)
         ph_targets = ph_targets.to(self.device)
+        if _prosody_feat is not None:
+            _prosody_feat = _prosody_feat.to(self.device)
         
         bpe_ids, bpe_lens, char_to_bpe = None, None, None
         if self.bpe_collator:
@@ -158,6 +161,7 @@ class ExplicitTrainer(SeedVoxTrainer):
         logits, targets, ph_planner_logits, jepa_loss, *_ = self.model(
             padded_text, padded_audio[:, :self.model.n_q], t_lens, a_lens, raw_texts=raw_texts,
             phoneme_ids=ph_targets, mimi_latents=mimi_latents,
+            prosody_feats=_prosody_feat,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
             drop_prob=0.1
         )
@@ -173,10 +177,19 @@ class ExplicitTrainer(SeedVoxTrainer):
         )
         
         loss_jepa = jepa_loss if jepa_loss is not None else torch.tensor(0.0, device=self.device)
-        
+
+        # Style loss (CE between the text->style head and the GT style cluster id),
+        # stashed by the model during forward().
+        loss_style = torch.tensor(0.0, device=self.device)
+        style_logits = getattr(self.model, '_last_style_logits', None)
+        gt_style_ids = getattr(self.model, '_last_gt_style_ids', None)
+        if style_logits is not None and gt_style_ids is not None:
+            loss_style = self.criterion(style_logits.view(-1, style_logits.shape[-1]), gt_style_ids.reshape(-1))
+
         total_loss = (loss_ar + 
                       self.cfg['training'].get('ph_planner_weight', 1.0) * loss_ph_planner + 
-                      self.cfg['training'].get('jepa_weight', 2.0) * loss_jepa)
+                      self.cfg['training'].get('jepa_weight', 2.0) * loss_jepa +
+                      self.cfg['training'].get('style_weight', 0.1) * loss_style)
         
         return total_loss, loss_ar, loss_jepa, loss_ph_planner
 

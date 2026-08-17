@@ -5,9 +5,15 @@ from seedvox.model import JEPAProsodyHybridModel, _sum_embeddings
 from .planner import PhoneticPlanner
 
 class FiLMAdapter(nn.Module):
-    def __init__(self, speaker_dim, target_dim):
+    def __init__(self, speaker_dim, target_dim, attn_pool=True):
         super().__init__()
         self.norm = nn.LayerNorm(target_dim)
+        self.attn_pool = attn_pool
+        if attn_pool:
+            # Attention-pool the full speaker latent sequence instead of a mean,
+            # so FILM can weight the tokens that actually carry identity.
+            self.pool_q = nn.Linear(speaker_dim, speaker_dim)
+            self.pool_w = nn.Linear(speaker_dim, 1)
         self.proj = nn.Linear(speaker_dim, target_dim * 2)
         # Initialize: gamma proj to ~0 (so output scale ~1), beta proj to ~0
         nn.init.zeros_(self.proj.weight)
@@ -15,10 +21,16 @@ class FiLMAdapter(nn.Module):
         # Bias for gamma starts at 1.0 (so scale is 1.0 initially)
         self.proj.bias.data[:target_dim] = 1.0 
         
-    def forward(self, x, speaker_latents):
+    def forward(self, x, speaker_tokens):
         # x is [B, T, D]
-        # speaker_latents is [B, D]
-        params = self.proj(speaker_latents).unsqueeze(1) # [B, 1, D*2]
+        # speaker_tokens is [B, L, D] (full sequence) or [B, D] (already pooled)
+        if self.attn_pool and speaker_tokens.dim() == 3:
+            w = self.pool_w(self.pool_q(speaker_tokens)).squeeze(-1)  # [B, L]
+            w = F.softmax(w, dim=-1)
+            speaker = (w.unsqueeze(-1) * speaker_tokens).sum(dim=1)   # [B, D]
+        else:
+            speaker = speaker_tokens.mean(dim=1) if speaker_tokens.dim() == 3 else speaker_tokens
+        params = self.proj(speaker).unsqueeze(1) # [B, 1, D*2]
         gamma, beta = params.chunk(2, dim=-1)
         return self.norm(x) * gamma + beta
 
@@ -68,8 +80,9 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
         
         # 5. FiLM Adapters for Prosody and Phonemes
         speaker_dim = self.cfg.get('speaker_dim', self.dim) # Assuming speaker latent dim matches
-        self.film_prs = FiLMAdapter(speaker_dim, self.dim)
-        self.film_phn = FiLMAdapter(speaker_dim, self.dim)
+        use_film_pool = self.cfg.get('use_film_pool', True)
+        self.film_prs = FiLMAdapter(speaker_dim, self.dim, attn_pool=use_film_pool)
+        self.film_phn = FiLMAdapter(speaker_dim, self.dim, attn_pool=use_film_pool)
         
     def get_enriched_text_feat(self, text, text_lens, raw_texts=None, bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None):
         text_feat, _ = self.encode_text(text, text_lens, raw_texts)
@@ -92,28 +105,32 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
 
     def encode_context(self, text, text_lens, audio_tokens=None, audio_lens=None, raw_texts=None, 
                        use_speaker=None, use_prosody=None, phoneme_ids=None, mimi_latents=None,
+                       prosody_feats=None,
                        bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
                        drop_prob=0.0, external_speaker=None, external_prosody=None,
-                       text_feat=None):
+                       text_feat=None, exagg=1.0, prosody_temperature=None,
+                       style_ids=None, external_style=None):
         
         # 1. Get Base Context (Speaker, Prosody, Text)
-        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec = super().encode_context(
+        context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec, prs_emb = super().encode_context(
             text, text_lens, audio_tokens, audio_lens, raw_texts,
             use_speaker, use_prosody, phoneme_ids=None, mimi_latents=mimi_latents,
+            prosody_feats=prosody_feats,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
             drop_prob=drop_prob, external_speaker=external_speaker, external_prosody=external_prosody,
-            text_feat=text_feat
+            text_feat=text_feat, exagg=exagg, prosody_temperature=prosody_temperature,
+            style_ids=style_ids, external_style=external_style
         )
         
-        # 2. Extract Speaker Latents for FiLM
-        # We need a single vector representing the speaker. 
+        # 2. Extract Speaker Latents for FiLM (full sequence -> attention-pooled)
+        # We need a vector representing the speaker.
         # In JEPAProsodyHybridModel, context = [spk, adapted_prosody, text_feat]
         # spk is [B, spk_len, dim]
         spk_len = self.cfg['num_speaker_latents'] if (use_speaker if use_speaker is not None else self.use_speaker) else 0
         if spk_len > 0:
-            speaker_latents = context[:, :spk_len, :].mean(dim=1)
+            speaker_tokens = context[:, :spk_len, :]
         else:
-            speaker_latents = torch.zeros(text.shape[0], self.dim, device=text.device)
+            speaker_tokens = torch.zeros(text.shape[0], 1, self.dim, device=text.device)
 
         # 3. Augmented with Explicit Phonemes
         if phoneme_ids is not None:
@@ -127,8 +144,8 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
             
             # Apply FiLM Modulation to phonemes and prosody if enabled
             if self.cfg.get('use_film', True):
-                ph_feat = self.film_phn(ph_feat, speaker_latents)
-                prs_feat = self.film_prs(prs_feat, speaker_latents)
+                ph_feat = self.film_phn(ph_feat, speaker_tokens)
+                prs_feat = self.film_prs(prs_feat, speaker_tokens)
                 
             # Reconstruct context with markers
             spk = context[:, :spk_len, :]
@@ -143,10 +160,8 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
             ], dim=1)
             
             # Update mask (new structure: [1, spk_len, 1, prs_len, 1, ph_len, 1, txt_len])
-            # Original spk_prs_len = spk_len + prs_len
             ph_mask = (phoneme_ids == 0) # True for padding
             
-            # Correcting mask construction for the new layout
             B, T = text.shape[0], new_context.shape[1]
             new_mask = torch.zeros(B, T, device=text.device, dtype=torch.bool)
             
@@ -169,12 +184,13 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
             # 4. Txt
             new_mask[:, curr : curr + 1 + txt.shape[1]] = torch.cat([mk_marker(B, text.device), ctx_mask[:, spk_len + prs_len:]], dim=1)
             
-            return new_context, new_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec
+            return new_context, new_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec, prs_feat.mean(dim=1)
             
-        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec
+        return context, ctx_mask, ph_logits, jepa_loss, contrastive_loss, spk_vec, prs_emb
 
     def forward(self, text, audio_tokens, text_lens, audio_lens, raw_texts=None, 
                 use_speaker=None, use_prosody=None, phoneme_ids=None, mimi_latents=None,
+                prosody_feats=None,
                 bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
                 drop_prob=0.0):
         
@@ -200,15 +216,16 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
         if audio_tokens is not None:
             audio_tokens = audio_tokens[:, :self.n_q]
             
-        context, ctx_mask, _, jepa_loss, _, spk_vec = self.encode_context(
+        context, ctx_mask, _, jepa_loss, _, spk_vec, prs_emb = self.encode_context(
             text, text_lens, audio_tokens, audio_lens, raw_texts, 
             use_speaker, use_prosody, phoneme_ids, mimi_latents=mimi_latents,
+            prosody_feats=prosody_feats,
             bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None,
             drop_prob=drop_prob,
             text_feat=text_feat
         )
         
-        logits, targets, latent_pred = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens, speaker_emb=spk_vec)
+        logits, targets, latent_pred = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens, speaker_emb=spk_vec, prosody_emb=prs_emb)
         
         return logits, targets, ph_planner_logits, jepa_loss, None, latent_pred
 
@@ -217,32 +234,41 @@ class ExplicitPlannerModel(JEPAProsodyHybridModel):
                bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None, phoneme_ids=None, drop_prob=0.0,
                external_speaker=None, external_prosody=None,
                precomputed_context=None, precomputed_mask=None,
-               spk_vec=None):
+               spk_vec=None, min_p=0.0, rep_penalty=1.0, exagg=1.0, mono_slack=0.0,
+               prosody_emb=None, prosody_temperature=None,
+               style_ids=None, external_style=None):
         
         # Calculate CFG offset for [M_spk, Spk, M_prs, Prs, M_phn, Phn, M_txt, Txt]
         spk_len = self.cfg['num_speaker_latents'] if (use_speaker if use_speaker is not None else self.use_speaker) else 0
         prs_len = self.cfg.get('num_prosody_tokens', 32)
         
-        if phoneme_ids is not None:
-            offset = 2 + spk_len + prs_len
-        else:
-            offset = spk_len + prs_len
-
         # Encode context ourselves to capture spk_vec for speaker AdaLN
         if precomputed_context is None:
-            context, ctx_mask, _, _, _, spk_vec = self.encode_context(
+            context, ctx_mask, _, _, _, spk_vec, prs_emb = self.encode_context(
                 text, text_lens, audio_tokens=ref_audio, audio_lens=ref_lens,
                 raw_texts=raw_texts, use_speaker=use_speaker, use_prosody=use_prosody,
                 bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe, char_lens=char_lens,
                 phoneme_ids=phoneme_ids, drop_prob=drop_prob,
-                external_speaker=external_speaker, external_prosody=external_prosody
+                external_speaker=external_speaker, external_prosody=external_prosody,
+                exagg=exagg, prosody_temperature=prosody_temperature,
+                style_ids=style_ids, external_style=external_style
             )
             precomputed_context, precomputed_mask = context, ctx_mask
+            if prosody_emb is None:
+                prosody_emb = prs_emb
+
+        if phoneme_ids is not None:
+            offset = 2 + spk_len + prs_len
+        else:
+            offset = spk_len + prs_len
 
         return super().sample(
             text, text_lens, ref_audio, ref_lens, max_steps, temp, curr_n_q, raw_texts, top_k, top_p, use_speaker, use_prosody, cfg_scale,
             bpe_ids, bpe_lens, char_to_bpe, char_lens, phoneme_ids, drop_prob,
             external_speaker, external_prosody,
             precomputed_context=precomputed_context, precomputed_mask=precomputed_mask,
-            offset=offset, spk_vec=spk_vec
+            offset=offset, spk_vec=spk_vec,
+            min_p=min_p, rep_penalty=rep_penalty, exagg=exagg, mono_slack=mono_slack,
+            prosody_emb=prosody_emb, prosody_temperature=prosody_temperature,
+            style_ids=style_ids, external_style=external_style
         )

@@ -260,12 +260,22 @@ class SeedVoxTrainer:
         
         # JEPA Loss
         loss_jepa = jepa_loss if jepa_loss is not None else torch.tensor(0.0, device=self.device)
-        
+
+        # Style Loss (CE between the text->style head and the GT style cluster id).
+        # The model stashes the head logits and the GT style ids (nearest
+        # style-bank centroid to the GT prosody latent) during forward().
+        loss_style = torch.tensor(0.0, device=self.device)
+        style_logits = getattr(self.model, '_last_style_logits', None)
+        gt_style_ids = getattr(self.model, '_last_gt_style_ids', None)
+        if style_logits is not None and gt_style_ids is not None:
+            loss_style = self.criterion(style_logits.view(-1, style_logits.shape[-1]), gt_style_ids.reshape(-1))
+
         jepa_weight = self.cfg['training'].get('jepa_weight', 2.0)
         ph_weight = self.cfg['training'].get('ph_weight', 0.1)
-        
-        total_loss = loss_ar + ph_weight * loss_ph + jepa_weight * loss_jepa
-        
+        style_weight = self.cfg['training'].get('style_weight', 0.1)
+
+        total_loss = loss_ar + ph_weight * loss_ph + jepa_weight * loss_jepa + style_weight * loss_style
+
         return total_loss, loss_ar, loss_jepa, loss_ph
 
     def train(self):

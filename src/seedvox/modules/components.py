@@ -92,7 +92,7 @@ class MonotonicAttention(nn.Module):
         self.heads, self.head_dim = heads, dim // heads
         self.qkv, self.proj = nn.Linear(dim, dim * 3), nn.Linear(dim, dim)
 
-    def forward(self, x, mask=None, kv_input=None, kv_mask=None, mono_bias=None, precomputed_kv=None):
+    def forward(self, x, mask=None, kv_input=None, kv_mask=None, mono_bias=None, precomputed_kv=None, return_attn=False):
         B, T, C = x.shape
         if kv_input is not None:
             qkv_q = self.qkv(x)
@@ -103,6 +103,7 @@ class MonotonicAttention(nn.Module):
             qkv = self.qkv(x).reshape(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
             q, k, v = qkv[0], qkv[1], qkv[2]
             
+        attn_weights = None
         if q.dtype != torch.float32:
             # Clean SDPA path for BF16/FP16 (FlashAttention)
             attn_mask = None
@@ -113,7 +114,8 @@ class MonotonicAttention(nn.Module):
                     attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
                     if mono_bias is not None: attn = attn + mono_bias.unsqueeze(1)
                     if kv_mask is not None: attn = attn.masked_fill(kv_mask.view(B, 1, 1, -1), float('-inf'))
-                    out = F.softmax(attn, dim=-1) @ v
+                    attn_weights = F.softmax(attn, dim=-1)
+                    out = attn_weights @ v
                 else:
                     if kv_mask is not None:
                         attn_mask = torch.zeros(B, 1, 1, kv_mask.shape[1], device=kv_mask.device, dtype=q.dtype)
@@ -133,9 +135,13 @@ class MonotonicAttention(nn.Module):
                 attn = attn + mono_bias.unsqueeze(1)
             if mask is not None: attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), float('-inf'))
             if kv_mask is not None: attn = attn.masked_fill(kv_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
-            out = F.softmax(attn, dim=-1) @ v
+            attn_weights = F.softmax(attn, dim=-1)
+            out = attn_weights @ v
             
-        return self.proj(out.transpose(1, 2).reshape(B, T, C))
+        out = self.proj(out.transpose(1, 2).reshape(B, T, C))
+        if return_attn:
+            return out, attn_weights
+        return out
 
 class AdaLN(nn.Module):
     def __init__(self, dim):

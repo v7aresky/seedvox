@@ -4,6 +4,56 @@ from seedvox.utils.tokenizer import PhonemeTokenizer
 from seedvox.utils.text import normalize_text
 from seedvox.utils.g2p_factory import get_phoneme_generator
 
+
+def extract_ref_prosody_latent(wav_path, model, device):
+    """Encode a reference wav's prosody into the stage-1 codec latent space
+    ([1, num_blocks, dim]) that the planner/decoder are trained against.
+
+    wav -> F0/energy/voicing (12.5 Hz, 3ch, center-normalized) via the same
+    extractor used for training data, zero-padded to a multiple of num_blocks
+    (codec pooling convention, matching train_prosody_codec.collate), then
+    ProsodyCodec.encode (the frozen stage-1 teacher). The random prosody_encoder
+    is NOT used; it never appears in the training graph.
+    """
+    import sys
+    from pathlib import Path
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tools.prepare_prosody_codec_data import extract_prosody
+    import numpy as np
+
+    pr = extract_prosody(wav_path)
+    if pr is None or '_error' in pr:
+        raise RuntimeError(f"Prosody extraction failed for {wav_path}: {pr}")
+
+    T = pr['log_f0_center'].shape[0]
+    nb = int(model.prosody_codec.num_blocks)
+    T_pad = max(nb, ((T + nb - 1) // nb) * nb)
+    feats = np.zeros((T_pad, 3), dtype=np.float32)
+    feats[:T, 0] = pr['log_f0_center']
+    feats[:T, 1] = pr['e_center']
+    feats[:T, 2] = pr['voicing'].astype(np.float32)
+    dtype = next(model.prosody_codec.parameters()).dtype
+    ft = torch.from_numpy(feats).unsqueeze(0).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        return model.prosody_codec.encode(ft)
+
+
+def filter_state_dict(model, state_dict):
+    """Drop keys whose shapes don't match the model. load_state_dict(strict=False)
+    still raises on size mismatches, so pre-filter them out (resized layers such as
+    the 16->32 prosody planner re-initialize)."""
+    msd = model.state_dict()
+    filtered = {k: v for k, v in state_dict.items() if k in msd and msd[k].shape == v.shape}
+    dropped = sorted(set(state_dict.keys()) - set(filtered.keys()))
+    if dropped:
+        print(f"[filter_state_dict] Dropped {len(dropped)} keys (shape mismatch / not in model):")
+        for k in dropped[:10]:
+            print(f"  - {k}  (ckpt {tuple(state_dict[k].shape) if state_dict[k].dim() else 'scalar'} vs model "
+                  f"{tuple(msd[k].shape) if k in msd else 'missing'})")
+    return filtered
+
 class PhoneticGenerator:
     """
     Utility for generating phoneme targets for training the PhoneticPlanner.

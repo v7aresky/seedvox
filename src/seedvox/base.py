@@ -97,6 +97,26 @@ class JEPAProsodyBase(StreamingContainer):
             self.dim, self.dim // 64, cfg['depformer_num_layers'],
             int(4.0 * self.dim), causal=True, context=self.n_q, positional_embedding="rope"
         )
+        # Direct speaker conditioning for the NAR depformer (codebook predictor).
+        # Voice/timbre lives in the residual codebooks, so give the depformer its
+        # own speaker signal instead of relying only on the AR context tokens.
+        # Zero-init => identity at load, so existing checkpoints stay valid.
+        self.use_dep_speaker_cond = cfg.get('use_dep_speaker_cond', True)
+        if self.use_dep_speaker_cond:
+            self.dep_speaker_adaLN = AdaLN(self.dim)
+            with torch.no_grad():
+                nn.init.zeros_(self.dep_speaker_adaLN.mlp[1].weight)
+                nn.init.zeros_(self.dep_speaker_adaLN.mlp[1].bias)
+        # Direct prosody conditioning for the NAR depformer (codebook predictor).
+        # Without this, prosody only reaches the depformer indirectly through the AR
+        # decoder's hidden state (which the probe showed barely absorbs prosody).
+        # Zero-init => identity at load, so existing checkpoints stay valid.
+        self.use_dep_prosody_cond = cfg.get('use_dep_prosody_cond', True)
+        if self.use_dep_prosody_cond:
+            self.dep_prosody_adaLN = AdaLN(self.dim)
+            with torch.no_grad():
+                nn.init.zeros_(self.dep_prosody_adaLN.mlp[1].weight)
+                nn.init.zeros_(self.dep_prosody_adaLN.mlp[1].bias)
         self.latent_regressor = nn.Sequential(
             nn.Linear(self.dim, self.dim),
             nn.GELU(),
@@ -119,7 +139,7 @@ class JEPAProsodyBase(StreamingContainer):
         t_mask = (valid.unsqueeze(2) & valid.unsqueeze(1)).unsqueeze(1)
         return self.text_encoder(self.text_emb(text_in), mask=t_mask), text_in
     
-    def forward_with_context(self, context, ctx_mask, audio_tokens, audio_lens, speaker_emb=None):
+    def forward_with_context(self, context, ctx_mask, audio_tokens, audio_lens, speaker_emb=None, prosody_emb=None):
         B, K, Ta = audio_tokens.shape
         device = audio_tokens.device
         a_in = torch.full((B, K, Ta + 1), self.SOA_ID, device=device, dtype=torch.long)
@@ -145,6 +165,16 @@ class JEPAProsodyBase(StreamingContainer):
         flat_out = x.reshape(B * T_a_in, 1, self.dim).transpose(0, 1)
         flat_tgt = a_tgt.transpose(1, 2).reshape(1, B * T_a_in, K).transpose(1, 2)
         
+        dep_spk = None
+        if speaker_emb is not None and getattr(self, 'use_dep_speaker_cond', True):
+            spk1d = speaker_emb.mean(dim=1) if speaker_emb.dim() == 3 else speaker_emb  # [B, D]
+            dep_spk = spk1d[:, None, :].expand(B, T_a_in, -1).reshape(B * T_a_in, -1)  # [B*T, D]
+
+        dep_prs = None
+        if prosody_emb is not None and getattr(self, 'use_dep_prosody_cond', True):
+            prs1d = prosody_emb.mean(dim=1) if prosody_emb.dim() == 3 else prosody_emb  # [B, D]
+            dep_prs = prs1d[:, None, :].expand(B, T_a_in, -1).reshape(B * T_a_in, -1)  # [B*T, D]
+
         dep_inputs = []
         for k in range(self.n_q):
             level_ctx = torch.cat([flat_out, self.dep_level_emb[:, k:k+1, :].expand_as(flat_out)], dim=-1)
@@ -154,6 +184,10 @@ class JEPAProsodyBase(StreamingContainer):
                 dep_inputs.append(self.dep_in[k](level_ctx) + self.dep_emb[k-1](flat_tgt[:, k-1]))
         
         d_out = self.dep_transformer(torch.stack(dep_inputs, 2).view(B * T_a_in, self.n_q, -1))
+        if dep_prs is not None:
+            d_out = self.dep_prosody_adaLN(d_out, dep_prs)
+        if dep_spk is not None:
+            d_out = self.dep_speaker_adaLN(d_out, dep_spk)
         logits = torch.stack([self.dep_layers[k](d_out[:, k, :]).view(B, T_a_in, self.card + 3) for k in range(self.n_q)], 0)
         # Predict continuous acoustic latents (for auxiliary L1 loss against mimi.decode_latent output)
         latent_feat = d_out.view(B, T_a_in, self.n_q, -1).mean(dim=2)
