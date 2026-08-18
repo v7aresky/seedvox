@@ -24,6 +24,12 @@ dependencies = [
     "tqdm",
     "safetensors",
     "transformers",
+    "sphn",
+    "aiohttp",
+    "huggingface_hub",
+    "phonemizer",
+    "sentencepiece",
+    "g2p_en",
 ]
 
 [tool.setuptools]
