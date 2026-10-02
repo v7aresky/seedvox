@@ -78,10 +78,6 @@ python -m explicit_pros_phon_planner.infer \
 
 **[SeedVox presentation and demo →](https://v7aresky.github.io/seedvox/)**
 
-A 10-sentence narrative generated on a consumer laptop GPU, using a single reference speaker. All prosody is sampled from the JEPA world model — no manual tuning, no style tags.
-
-> **Note on the reference voice:** The speaker is **LJ Speech** — a single-speaker audiobook corpus. LJ Speech is *read speech*: monotone, low expressiveness, no conversational dynamics. Expressive conversational training data will sound considerably more natural.
-
 ---
 
 ## Architecture
