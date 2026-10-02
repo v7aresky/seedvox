@@ -74,9 +74,9 @@ python -m explicit_pros_phon_planner.infer \
 
 ---
 
-## Demo
+## Presentation & Demo
 
-**[Listen to the demo →](https://v7aresky.github.io/seedvox/)**
+**[SeedVox presentation and demo →](https://v7aresky.github.io/seedvox/)**
 
 A 10-sentence narrative generated on a consumer laptop GPU, using a single reference speaker. All prosody is sampled from the JEPA world model — no manual tuning, no style tags.
 
