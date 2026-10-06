@@ -7,10 +7,10 @@ In a world of rapidly evolving AI, **SeedVox** is designed to bring **State-of-t
 ---
 
 ### 🧠 The "Thinker & Painter" Architecture
-**SeedVox** bridges the gap between stability and speed using a sophisticated **Hybrid AR-Flow** design:
+**SeedVox** bridges the gap between stability and speed using a sophisticated **Hybrid AR-JEPA** design:
 
 1.  **The Thinker (AR Stage):** A sequential "brain" handles the linguistic foundation. It ensures every word is accounted for and that the rhythm of speech feels natural and consistent. ⚓
-2.  **The Painter (Parallel Flow):** A high-speed parallel engine "paints" the rich acoustic textures and human emotion onto that foundation. 🎨
+2.  **The Painter (Parallel Codebook Decoder):** A high-speed parallel transformer completes the remaining codebook frames, "painting" the rich acoustic textures and human emotion onto that foundation. 🎨
 
 **The Result:** A system that delivers professional-grade clarity and expression with the efficiency required for real-time interaction. 🏎️💨
 
@@ -28,7 +28,7 @@ We believe that advanced AI research should be accessible. **SeedVox** is engine
 ### 🎓 An Open Learning Environment
 **SeedVox** is designed as a **transparent classroom** for the next generation of AI researchers.
 
-*   **Architectural Clarity:** Explore a clean, modern codebase to see how **Transformers**, **Flow-Matching**, and **Neural Codecs** (like Mimi) work in harmony. 📖
+*   **Architectural Clarity:** Explore a clean, modern codebase to see how **Transformers**, **JEPA planning**, and **Neural Codecs** (like Mimi) work in harmony. 📖
 *   **Local Sovereignty:** Run your models entirely offline. You have full control over your data, your training process, and your creative output. 🔐
 *   **Zero-Cost Iteration:** Experiment, refine, and retrain as often as needed. Local execution allows for unlimited creativity without the need for external usage credits. 💸
 

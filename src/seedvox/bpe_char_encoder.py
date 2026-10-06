@@ -80,12 +80,12 @@ class BPECharEncoder(nn.Module):
         shifted = torch.cat([torch.zeros((B, 1), device=device, dtype=char_to_bpe_batch.dtype), char_to_bpe_batch[:, :-1]], dim=1)
         boundary = (char_to_bpe_batch != shifted).long()
         cumsum = torch.arange(T_char_max, device=device).unsqueeze(0).expand(B, -1)
-        last_boundary = torch.zeros((B,), device=device, dtype=torch.long)
-        intra_pos = torch.zeros((B, T_char_max), device=device, dtype=torch.long)
-        for t in range(T_char_max):
-            is_boundary = boundary[:, t]
-            last_boundary = torch.where(is_boundary == 1, cumsum[:, t], last_boundary)
-            intra_pos[:, t] = cumsum[:, t] - last_boundary
+        # Vectorized intra-word position: running max over boundary positions gives
+        # the most recent boundary index t, so intra = t - last_boundary (0 at each
+        # boundary, matching the previous per-character synchronous loop).
+        boundary_marks = torch.where(boundary == 1, cumsum, torch.zeros_like(cumsum))
+        last_boundary = torch.cummax(boundary_marks, dim=1).values
+        intra_pos = (cumsum - last_boundary).clamp(min=0)
         return char_features + self.intra_word_emb(intra_pos.clamp(max=19))
 
 def get_bpe_encoder_from_config(cfg, device='cpu'):

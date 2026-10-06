@@ -69,7 +69,7 @@ python -m explicit_pros_phon_planner.infer \
 - **Optimized inference:** Gradient checkpointing, Fused AdamW, `torch.compile` — latencies under 400ms on consumer GPUs.
 - **N-variant generation:** `--variant_axis pros` or `--variant_axis speaker` to explore the latent space.
 - **LoRA fine-tuning:** Adapt to new voices with lightweight low-rank adapters (`--lora_checkpoint`).
-- **CFG scale tuning:** `--cfg_scale` to balance prosody diversity vs. reference fidelity.
+- **CFG scale tuning:** `--cfg_scale` for reference fidelity — contrasts a full-context decode against a text-blind, prosody-grounded decode.
 - **Temperature control:** `--phoneme_temperature`, `--prosody_temperature`, `--acoustic_temperature`.
 
 ---
@@ -96,32 +96,40 @@ graph TD
 
     subgraph CORE["SeedVox — generation path"]
         subgraph JEPA["JEPA World Model"]
-            J["JEPA Prosody Planner<br/>reads the full sentence, predicts a global<br/>prosody latent (B, 32, dim)"]
+            J["JEPA Prosody Planner<br/>reads the full sentence at once, predicts a<br/>global prosody latent (B, 32, dim)"]
         end
 
         subgraph AR["AR Backbone"]
             A["AR Phonetic Planner<br/>text → phonemes<br/>(what is said)"]
-            B["AR Acoustic Decoder<br/>phonemes → audio tokens<br/>(the voice)"]
-            A --> B
+            L["Linguistic Fusion<br/>gated cross-attention merges<br/>phonemes into the text backbone<br/>(prosody-neutral)"]
+            B["AR Acoustic Decoder<br/>unified text + prosody plan (parallel)<br/>→ RVQ audio tokens"]
+            A --> L --> B
         end
 
-        J -.->|"prosody latent<br/>guides generation"| B
+        M["Mimi Neural Codec Decoder<br/>RVQ audio tokens → 24 kHz waveform"]
+
+        J -.->|"prosody plan conditions<br/>the decoder (parallel to text)"| B
+
+        B -->|"audio tokens"| M
+        M --> OUT["Speech audio"]
     end
 
     subgraph TRAIN["Training only"]
-        T["Frozen Prosody Codec<br/>(F0 / Energy / Voicing → latent)<br/>supervises the JEPA planner"]
+        T["Frozen Prosody Codec &amp; Mimi encoder<br/>(F0 / Energy / Voicing → latent)<br/>supervise the JEPA planner"]
     end
 
     TXT --> A
     VOI["Reference audio<br/>(optional)"] -.->|"speaker identity"| B
     T -.->|"trains"| J
-    B --> OUT["Speech audio"]
 
     style CORE fill:#ebfbee,stroke:#2f9e44
     style JEPA fill:#e6fcf5,stroke:#0ca678
     style AR fill:#ebfbee,stroke:#2f9e44
+    style M fill:#e7f5ff,stroke:#1971c2
     style TRAIN fill:#fff4e6,stroke:#e8590c
 ```
+
+**Generation-path decisions:** (1) The **Mimi neural codec decoder** lives inside the generation path — at inference it converts the acoustic decoder's RVQ codes into the 24 kHz waveform, and it is LoRA-fine-tunable alongside the decoder. Only the Mimi *encoder* and quantizer are frozen training-time teachers. (2) The **JEPA prosody plan is *not* fused into the Unified Text**. Both are fed to the acoustic decoder in parallel — the prose‑word tells it *what*, the prosody latent tells it *how*. Keeping the linguistic representation prosody-neutral is the same disentanglement rationale as the Dual-FiLM speaker adapters.
 
 ### Detailed pipeline
 
@@ -196,13 +204,57 @@ graph TD
 
 **Legend:** solid arrows = data flow; dashed arrows = conditioning, supervision, or training-only paths. 🟢 generation path (train + inference). 🟠 frozen teacher (training only). 🔵 decoder + depformer.
 
+### Mimi decoder layout
+
+```mermaid
+graph TD
+    subgraph IN["From the acoustic decoder"]
+        RVT["RVQ audio codes<br/>(B, 16, T) — first 16 of 32<br/>codebooks, integer ids ∈ [0, 2048)"]
+    end
+
+    subgraph MIMI["Mimi neural codec — decode path"]
+        subgraph Q["Codebook lookup<br/>(quantizer, frozen)"]
+            CB["Per-codebook embedding lookup<br/>(16 × 256-dim)"]
+            SUM["Residual sum over the 16 codes<br/>→ (B, T, 512)"]
+            CB --> SUM
+        end
+
+        subgraph DT["Decoder transformer<br/>(LoRA-adaptable)"]
+            DTX["8 causal transformer layers<br/>RoPE · conv-layout · ctx 250<br/>d_model 512 · layer_scale 0.01"]
+        end
+
+        subgraph SD["Waveform decoder<br/>(LoRA-adaptable)"]
+            SU["Conv upsampling blocks<br/>ratios reversed [4, 5, 6, 8]<br/>ELU · true-skip"]
+            RU["Resample conv → 24 kHz"]
+            SU --> RU
+        end
+
+        SUM --> DTX
+        DTX --> SU
+    end
+
+    RVT --> CB
+    RU --> OUT["Audio waveform<br/>(B, 1, N) — 24 kHz mono"]
+
+    style IN fill:#f8f9fa,stroke:#dee2e6
+    style MIMI fill:#e7f5ff,stroke:#1971c2
+    style Q fill:#fff4e6,stroke:#e8590c
+    style DT fill:#d0ebff,stroke:#1971c2
+    style SD fill:#d0ebff,stroke:#1971c2
+```
+
+Token frame rate is 12.5 Hz, aligned with the F0/energy prosody frames the planner supervises against. The encoder and quantizer are frozen (`freeze_encoder`, `freeze_quantizer`); only the decoder side — `decoder_transformer`, `decoder`/SEANet decoder, and `upsample` — is trainable, and it's what the voice LoRA adapters target (`MIMI_DECODER_TARGETS`).
+
+---
+
 ### Key design choices
 
 - **JEPA prosody planning:** Prosody is a global state of mind, not a token-level dice roll. The planner emits a learned `(B, 32, dim)` latent that shapes the entire utterance before generation begins.
 - **Latent, not features:** Raw F0/Energy/Voicing only feed the frozen codec as a training target. Generation conditions exclusively on the learned latent.
-- **Unified linguistic fusion:** A gated cross-attention layer folds phonemes into the text backbone before acoustic generation.
+- **Unified linguistic fusion:** A gated cross-attention layer folds the AR phoneme planning into the text backbone — one grounded, unified representation for acoustic generation.
 - **Dual-FiLM disentanglement:** Two speaker-modulated FiLM adapters separate articulation from rhythm/emotion.
 - **Intervenable control:** Phonemes are planned explicitly — researchers can overwrite the phoneme string to fix pronunciations at runtime.
+- **The painter (AR/NAR renderer):** a streaming AR transformer over the codebooks, completed in parallel by a NAR depformer, turns the plans into discrete audio tokens.
 
 ---
 

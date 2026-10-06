@@ -126,7 +126,7 @@ def play_audio_v5(audio_tensor, sample_rate=24000):
     
     fd, tmp_path = tempfile.mkstemp(suffix='.wav')
     os.close(fd)
-    torchaudio.save(tmp_path, audio_tensor.unsqueeze(0).cpu() if audio_tensor.dim() == 1 else audio_tensor.cpu(), sample_rate)
+    _save_audio(tmp_path, audio_tensor.unsqueeze(0).cpu() if audio_tensor.dim() == 1 else audio_tensor.cpu(), sample_rate)
     
     player_proc = None
     for player_cmd in ['paplay', 'aplay', 'ffplay -nodisp -autoexit', 'afplay']:
@@ -201,10 +201,44 @@ def play_audio_v5(audio_tensor, sample_rate=24000):
     return True
 
 def load_audio(path, device):
-    wav, sr = torchaudio.load(path)
-    if sr != 24000: wav = torchaudio.transforms.Resample(sr, 24000)(wav)
-    if wav.shape[0] > 1: wav = wav.mean(0, keepdim=True)
-    return wav.to(device)
+    """Load a reference wav, downmix to mono and resample to 24kHz (mimi's
+    native rate). Feeding mimi a raw 48kHz/22.05kHz waveform produces a
+    garbage speaker embedding (read at the wrong rate)."""
+    wav, sr = _read_audio(path)
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0)
+    if wav.shape[0] > 1:
+        wav = wav.mean(0, keepdim=True)
+    if sr != 24000:
+        resampler = torchaudio.transforms.Resample(sr, 24000).to(device)
+        wav = resampler(wav.to(device))
+    else:
+        wav = wav.to(device)
+    return wav
+
+def _save_audio(path, wav, sample_rate):
+    """Save a [ch, t] float waveform without torchcodec (soundfile first)."""
+    try:
+        import soundfile as sf
+        sf.write(path, wav.t().cpu().numpy(), sample_rate)
+        return
+    except Exception:
+        pass
+    torchaudio.save(path, wav.cpu(), sample_rate)
+
+def _read_audio(path):
+    """Read audio to float32 tensor [ch, t] without torchcodec.
+
+    Prefer soundfile (libsndfile, handles wav/flac/ogg/mp3); fall back to
+    torchaudio's soundfile backend, then to torchaudio defaults."""
+    try:
+        import soundfile as sf
+        wav, sr = sf.read(path, dtype="float32", always_2d=True)
+        return torch.from_numpy(wav.T), sr
+    except Exception:
+        pass
+    wav, sr = torchaudio.load(path, backend="soundfile")
+    return wav, sr
 
 def de_emphasize(wav, coeff=0.95):
     if coeff <= 0:
@@ -456,6 +490,13 @@ def run_inference(args):
     dtype = torch.bfloat16 if args.dtype == 'bf16' else torch.float16 if args.dtype == 'fp16' else torch.float32
     autocast_enabled = args.dtype != 'fp32'
 
+    # Leading-silence runway: attach the same cached mimi silence codes the
+    # trainer used, so sampling injects the trained cold-start runway.
+    from explicit_pros_phon_planner.utils import attach_leading_sil_codes
+    if attach_leading_sil_codes(model, cfg, device=device):
+        print(f"  [Inference] leading-silence runway active "
+              f"({model.leading_sil_codes.shape[1]} frames x {model.leading_sil_codes.shape[0]}q)")
+
     # Load Mimi
     from seedvox.modules.mimi import get_mimi_model
     from explicit_pros_phon_planner.finetune_lora_fusion import inject_lora as inject_lora_fn, MIMI_DECODER_TARGETS
@@ -509,10 +550,13 @@ def run_inference(args):
         print("  Compiling audio prenet...")
         model.audio_prenet = torch.compile(model.audio_prenet, mode="reduce-overhead", dynamic=True)
         
-        if hasattr(model, 'phonetic_planner'):
-            print("  Compiling phonetic planner...")
-            model.phonetic_planner.transformer = torch.compile(model.phonetic_planner.transformer, mode="reduce-overhead", dynamic=True)
-            model.phonetic_planner = torch.compile(model.phonetic_planner, mode="reduce-overhead", dynamic=True)
+        # NOTE: the phonetic planner is deliberately NOT torch.compiled. Its
+        # streaming encoder retraces once per NEW text length, so a real utterance
+        # (longer than the 5-token warmup) pays a ~10-30s one-time recompilation
+        # inside the measured phonetics window. Uncompiled, its sampler loop runs at
+        # a few ms per phoneme step and tracks ~1s even for long sentences.
+        if hasattr(model, 'phonetic_planner') and False:
+            model.phonetic_planner.transformer = torch.compile(model.phonetic_planner.transformer, dynamic=True)
             
         # Mimi is a standard CNN/Transformer, default compilation is usually best.
         mimi = torch.compile(mimi, dynamic=True)
@@ -756,7 +800,7 @@ def run_inference(args):
         else:
             variant_output = args.output
 
-        torchaudio.save(variant_output, wav[0].cpu(), 24000)
+        _save_audio(variant_output, wav[0].cpu(), 24000)
         print(f"Saved generated audio to {variant_output}")
 
         if args.variant_n > 1 and args.log_metrics:

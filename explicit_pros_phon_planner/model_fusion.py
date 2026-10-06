@@ -42,6 +42,10 @@ class FusionPlannerModel(ExplicitPlannerModel):
             dim=self.dim,
             num_heads=config['model'].get('fusion_heads', 8)
         )
+        # F0-driven anchor projector: maps the frozen ProsodyCodec's F0-hidden
+        # ([B,T,256]) up to the 512-dim acoustic latent space so the cycle-loss
+        # anchor can read the bottleneck over F0 features (not mimi codebooks).
+        self.f0_anchor_proj = nn.Linear(256, self.dim)
         
     def encode_context(self, text, text_lens, audio_tokens=None, audio_lens=None, raw_texts=None, 
                        use_speaker=None, use_prosody=None, phoneme_ids=None, mimi_latents=None,

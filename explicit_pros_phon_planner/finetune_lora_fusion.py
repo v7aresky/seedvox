@@ -440,7 +440,7 @@ class FusionLoRATrainer:
             print(f"Resumed LoRA weights from {resume_lora} (epoch={self.start_epoch}, step={self.global_step})")
 
     def _compute_loss(self, batch):
-        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, padded_wav = batch
+        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, padded_wav, *_ = batch
 
         padded_text = padded_text.to(self.device)
         padded_audio = padded_audio.to(self.device)

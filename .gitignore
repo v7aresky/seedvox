@@ -38,3 +38,18 @@ EOF
 
 # tmp files
 *.*~
+# Big local data / artifact dirs and logs (not for publish)
+.opencode/
+pockettts/
+feynman_demo/
+demos/
+soccer/
+references/
+runs/
+explicit_pros_phon_planner/cache/
+explicit_pros_phon_planner/data/
+explicit_pros_phon_planner/runs/
+*.log
+training_*.log
+train_*.log
+*.lnk

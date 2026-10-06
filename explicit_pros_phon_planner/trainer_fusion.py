@@ -12,7 +12,8 @@ from seedvox.bpe_char_encoder import BPECharCollator
 from seedvox.utils.tokenizer import CharTokenizer
 from seedvox.training.dataset import TokenizedSpeechDataset, LengthGroupedSampler
 from .model_fusion import FusionPlannerModel
-from .utils import PhoneticGenerator, collate_phonemes, filter_state_dict
+from .utils import (PhoneticGenerator, collate_phonemes, filter_state_dict,
+                    attach_leading_sil_codes, PAUSE_PHONE_ID)
 from .trainer import ExplicitCollate
 
 
@@ -24,6 +25,13 @@ class FusionTrainer:
     def __init__(self, config, device, resume_path=None, ref_wav=None,
                  g2p_backend='espeak', num_workers=None):
         self.cfg, self.device = config, device
+        if device.type == 'cuda':
+            # Mixed precision: forward/backward run under autocast (fp16 matmuls)
+            # with fp32 master weights + GradScaler; remaining fp32 matmuls use TF32.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision('high')
         self.tokenizer = CharTokenizer()
         self.ema_decay = config['training'].get('ema_decay', 0.999)
         self.global_step = 0
@@ -32,7 +40,9 @@ class FusionTrainer:
         # 1. Model
         print("[FusionTrainer] Creating FusionPlannerModel...")
         self.model = FusionPlannerModel(config, self.tokenizer.vocab_size, phoneme_vocab_size=128).to(device)
-        self.ema_model = FusionPlannerModel(config, self.tokenizer.vocab_size, phoneme_vocab_size=128).to(device)
+        self._compiled_forward = None
+        self.current_epoch = 0
+        self.ema_model = FusionPlannerModel(config, self.tokenizer.vocab_size, phoneme_vocab_size=128).to(device).half()
         self.ema_model.eval()
         for p in self.ema_model.parameters(): p.requires_grad = False
 
@@ -54,15 +64,21 @@ class FusionTrainer:
 
         # 5. G2P + collate
         self.ph_generator = PhoneticGenerator(backend=g2p_backend, phoneme_vocab_size=128)
-        collate = ExplicitCollate(self.ph_generator)
+        lsil = config['training'].get('leading_silence', {}) or {}
+        collate = ExplicitCollate(self.ph_generator, bpe_collator=self.bpe_collator,
+                                  leading_pause=bool(lsil.get('phone_pause', False)),
+                                  pause_phone_id=PAUSE_PHONE_ID)
 
-        # 5b. Frozen Mimi decoder for the plan-follow (cycle) loss anchor: provides the
-        # GT acoustic latent (decode_latent) whose prosody must match the frozen codec's.
-        if config['training'].get('planner_cycle_weight', 0.0) > 0:
-            print("[FusionTrainer] Loading frozen Mimi for cycle-loss anchor...")
-            from seedvox.modules.mimi import get_mimi_model
-            self.mimi = get_mimi_model(device=device, checkpoint_path='pretrained_models/best_mimi.pt').eval()
-            for p in self.mimi.parameters(): p.requires_grad = False
+        # Leading-silence audio runway: encode real mimi silence codes (cached to
+        # disk) and attach them to the model. base.forward_with_context prepends
+        # them to the AR targets during training and the sampler injects them as
+        # warmup steps, so the model is taught to emit silence before the first
+        # phone instead of cold-starting into it.
+        self.leading_sil_frames = int(lsil.get('audio_frames', 0))
+        if self.leading_sil_frames > 0:
+            nq_sil = config['model']['n_q']
+            _ = attach_leading_sil_codes(self.model, config, device=device)
+            print(f"  Leading-silence runway: {nq_sil}q x {self.leading_sil_frames} codec frames")
 
         # 6. Dataset
         train_paths = config['training']['train_tokens_path']
@@ -82,7 +98,7 @@ class FusionTrainer:
             train_ds, batch_size=config['training']['batch_size'],
             sampler=LengthGroupedSampler(train_ds, config['training']['batch_size'],
                                          max_len=config['training'].get('max_audio_len_tokens', None)),
-            collate_fn=collate, pin_memory=True, num_workers=num_workers
+            collate_fn=collate, pin_memory=True, num_workers=num_workers, persistent_workers=num_workers > 0
         )
         self.eval_loader = None
         if n_val > 0:
@@ -101,10 +117,34 @@ class FusionTrainer:
         self.ph_planner_criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=0)
 
         nq = config['model']['n_q']
-        w = torch.ones(nq)
-        w[:nq // 2] = 1.5
-        w[nq // 2:] = 0.5
+        lw_cfg = config['training'].get('level_weights')
+        if lw_cfg is not None:
+            w = torch.tensor(lw_cfg, dtype=torch.float)
+            if w.shape[0] != nq:
+                raise ValueError(f"level_weights length {w.shape[0]} != n_q {nq}")
+        else:
+            w = torch.ones(nq)
         self.level_weights = (w / w.sum() * nq).to(device)
+        print(f"  AR level weights (per codebook, sum={self.level_weights.sum().item():.1f}): "
+              f"[{', '.join(f'{x:.3f}' for x in self.level_weights.tolist())}]")
+
+        ls_cfg = config['training'].get('label_smoothing', {})
+        if ls_cfg.get('enabled', False):
+            prof = ls_cfg.get('profile')
+            if prof is not None:
+                if len(prof) != nq:
+                    raise ValueError(f"label_smoothing profile length {len(prof)} != n_q {nq}")
+                self.eps_smooth = torch.tensor(prof, dtype=torch.float).to(device)
+            else:
+                coarse = float(ls_cfg.get('coarse_eps', 0.0))
+                detail = float(ls_cfg.get('detail_eps', 0.0))
+                split = int(ls_cfg.get('split_at', 8))
+                self.eps_smooth = torch.full((nq,), detail, device=device)
+                self.eps_smooth[:split] = coarse
+            print(f"  AR label smoothing eps (per codebook): "
+                  f"[{', '.join(f'{x:.3f}' for x in self.eps_smooth.tolist())}]")
+        else:
+            self.eps_smooth = torch.zeros(nq, device=device)
 
         # 8. Resume checkpoint (warm-start). Shapes differ for resized layers
         # (num_prosody_tokens 16->32), so pre-filter mismatched keys.
@@ -157,8 +197,16 @@ class FusionTrainer:
                 self.ema_model.load_state_dict(state_dict, strict=False)
 
         if config['training'].get('compile', False):
-            print("[FusionTrainer] Compiling model with torch.compile...")
-            self.model = torch.compile(self.model)
+            mode = str(config['training']['compile'])
+            if mode not in ('default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'):
+                mode = 'default'
+            print(f"[FusionTrainer] Compiling forward with torch.compile (mode={mode}, dynamic)...")
+            try:
+                self._compiled_forward = torch.compile(self.model.forward, mode=mode, dynamic=True)
+                print("  compiled forward ready")
+            except Exception as e:
+                print(f"  torch.compile failed, using eager forward: {e}")
+                self._compiled_forward = None
 
         # 9. Tensorboard
         run_name = f"fusion_{time.strftime('%Y%m%d-%H%M%S')}"
@@ -281,22 +329,41 @@ class FusionTrainer:
             raise RuntimeError("optimizer state invalid after rebuild")
 
 
+    def _checkpoint_dict(self, resume_epoch):
+        return {
+            'model': self.model.state_dict(),
+            'ema_model': self.ema_model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'scaler': self.scaler.state_dict(),
+            'step': self.global_step,
+            'epoch': resume_epoch,
+            'config': self.cfg
+        }
+
+    def _save_checkpoint(self, path, resume_epoch):
+        tmp = path + ".tmp"
+        torch.save(self._checkpoint_dict(resume_epoch), tmp)
+        os.replace(tmp, path)
+
     def _compute_loss(self, batch):
-        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, prosody_feat = batch
+        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, prosody_feat, bpe_ids, bpe_lens, char_to_bpe = batch
 
-        padded_text = padded_text.to(self.device)
-        padded_audio = padded_audio.to(self.device)
-        t_lens, a_lens = t_lens.to(self.device), a_lens.to(self.device)
-        ph_targets = ph_targets.to(self.device)
+        padded_text = padded_text.to(self.device, non_blocking=True)
+        padded_audio = padded_audio.to(self.device, non_blocking=True)
+        t_lens = t_lens.to(self.device, non_blocking=True)
+        a_lens = a_lens.to(self.device, non_blocking=True)
+        ph_targets = ph_targets.to(self.device, non_blocking=True)
         if prosody_feat is not None:
-            prosody_feat = prosody_feat.to(self.device)
+            prosody_feat = prosody_feat.to(self.device, non_blocking=True)
+        if bpe_ids is not None:
+            bpe_ids = bpe_ids.to(self.device, non_blocking=True)
+            bpe_lens = bpe_lens.to(self.device, non_blocking=True)
+            char_to_bpe = char_to_bpe.to(self.device, non_blocking=True)
 
-        bpe_ids, bpe_lens, char_to_bpe = None, None, None
-        if self.bpe_collator:
-            bpe_ids, bpe_lens, char_to_bpe = self.bpe_collator.process_batch_texts(raw_texts, t_lens, self.device)
-
-        logits, targets, ph_planner_logits, jepa_loss, _, latent_pred = self.model(
-            padded_text, padded_audio[:, :self.model.n_q], t_lens, a_lens, raw_texts=raw_texts,
+        fwd = self._compiled_forward or self.model
+        logits, targets, ph_planner_logits, jepa_loss, _, latent_pred = fwd(
+            padded_text, padded_audio[:, :self.model.n_q], t_lens, a_lens,
             phoneme_ids=ph_targets, prosody_feats=prosody_feat,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
             drop_prob=0.1 if self.model.training else 0.0
@@ -318,7 +385,17 @@ class FusionTrainer:
         weights_ar = torch.zeros(n_q, device=self.device)
         weights_ar[:num_enabled] = self.level_weights[:num_enabled]
         weights_flat = weights_ar[None, None, :].expand(B, T_audio, n_q).reshape(B * T_audio * n_q)
-        loss_ar = (F.cross_entropy(logits_btk, targets_btk, reduction='none', ignore_index=-1) * weights_flat).sum() / max(B * T_audio * num_enabled, 1)
+        if bool(self.eps_smooth.any()):
+            kept = self.eps_smooth[None, None, :].expand(B, T_audio, n_q).reshape(B * T_audio * n_q)
+            gz = torch.logsumexp(logits_btk, dim=-1)
+            z_y = logits_btk.gather(-1, targets_btk.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+            z_mn = logits_btk.mean(-1)
+            ce_ar = gz - ((1 - kept) * z_y + kept * z_mn)
+            ce_ar = ce_ar.masked_fill(targets_btk < 0, 0.0)
+        else:
+            ce_ar = F.cross_entropy(logits_btk, targets_btk, reduction='none', ignore_index=-1)
+        valid_ar = (targets_btk >= 0) & (weights_flat > 0)
+        loss_ar = (ce_ar * weights_flat).sum() / valid_ar.sum().clamp_min(1)
 
         loss_ph = self.ph_planner_criterion(
             ph_planner_logits.reshape(-1, ph_planner_logits.shape[-1]),
@@ -332,8 +409,10 @@ class FusionTrainer:
         # the model GENERATES; match it against the plan it was conditioned on. Gradient
         # flows through latent_pred -> latent_regressor -> depformer output -> decoder,
         # so the only way to reduce it is for the decoder's tokens to carry the plan.
-        # The anchor term distills prosody_bottleneck(gt_mimi) onto the frozen codec's
-        # GT latent so the bottleneck stays an honest audio->prosody readout.
+        # The anchor term keeps the bottleneck an honest audio->prosody readout by
+        # reading it over the FROZEN ProsodyCodec's F0-derived hidden (F0/E/V teacher,
+        # NOT mimi codebooks): bottleneck(F0-hidden) must match the F0 GT latent. This
+        # anchors the readout to F0 and stays codebook-count independent.
         loss_cycle = torch.tensor(0.0, device=self.device)
         cyc_w = self.cfg['training'].get('planner_cycle_weight', 0.0)
         anch_w = self.cfg['training'].get('cycle_anchor_weight', 0.0)
@@ -342,14 +421,25 @@ class FusionTrainer:
             gt_prs = getattr(self.model, '_last_gt_prosody', None)
             if plan is not None and plan.shape[0] == latent_pred.shape[0]:
                 plan = plan.detach()
-                a_mask = torch.arange(latent_pred.shape[-1], device=self.device).unsqueeze(0) >= a_lens.unsqueeze(1)
+                # AR/latent token grid is shifted by the leading-silence runway.
+                eff_lens = a_lens + self.leading_sil_frames
+                a_mask = torch.arange(latent_pred.shape[-1], device=self.device).unsqueeze(0) >= eff_lens.unsqueeze(1)
                 pred_prosody = self.model.prosody_bottleneck(latent_pred, mask=a_mask)
                 loss_cycle = cyc_w * (1 - F.cosine_similarity(pred_prosody, plan, dim=-1)).mean()
-                if anch_w > 0 and gt_prs is not None:
+                if anch_w > 0 and gt_prs is not None and prosody_feat is not None:
                     with torch.no_grad():
-                        gt_mimi = self.mimi.decode_latent(padded_audio[:, :self.model.n_q // 2])
-                    anchor_prosody = self.model.prosody_bottleneck(gt_mimi, mask=a_mask)
-                    loss_cycle = loss_cycle + anch_w * (1 - F.cosine_similarity(anchor_prosody, gt_prs.detach(), dim=-1)).mean()
+                        enc = self.model.prosody_codec.enc(prosody_feat)            # [B,T,256]
+                        h = self.model.prosody_codec.conv(enc.transpose(1, 2))       # [B,256,T]
+                        h = h.transpose(1, 2)                                        # [B,T,256]
+                    t = min(h.shape[1], a_mask.shape[-1])
+                    f0_h = self.model.f0_anchor_proj(h[:, :t])                       # [B,T,512]
+                    # The F0 anchor reads the ORIGINAL prosody-frame grid (the
+                    # runway has no F0 columns), so mask with the unshifted lens.
+                    a_mask_f0 = torch.arange(t, device=self.device).unsqueeze(0) >= a_lens.unsqueeze(1)
+                    anchor_prosody = self.model.prosody_bottleneck(
+                        f0_h.transpose(1, 2), mask=a_mask_f0)
+                    loss_cycle = loss_cycle + anch_w * (1 - F.cosine_similarity(
+                        anchor_prosody, gt_prs.detach(), dim=-1)).mean()
 
         # Style loss (CE between the text->style head and the GT style cluster id),
         # stashed by the model during forward().
@@ -385,31 +475,33 @@ class FusionTrainer:
         This is what the model actually does at inference; _compute_loss instead
         feeds GT prosody in and measures reconstruction, so it over-estimates
         quality. Stochastically sampled (like real inference)."""
-        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, prosody_feat = batch
-        padded_text = padded_text.to(self.device)
-        padded_audio = padded_audio.to(self.device)
-        t_lens, a_lens = t_lens.to(self.device), a_lens.to(self.device)
-        ph_targets = ph_targets.to(self.device)
+        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, prosody_feat, bpe_ids, bpe_lens, char_to_bpe = batch
+        padded_text = padded_text.to(self.device, non_blocking=True)
+        padded_audio = padded_audio.to(self.device, non_blocking=True)
+        t_lens = t_lens.to(self.device, non_blocking=True)
+        a_lens = a_lens.to(self.device, non_blocking=True)
+        ph_targets = ph_targets.to(self.device, non_blocking=True)
         if prosody_feat is not None:
-            prosody_feat = prosody_feat.to(self.device)
-
-        bpe_ids, bpe_lens, char_to_bpe = None, None, None
-        if self.bpe_collator:
-            bpe_ids, bpe_lens, char_to_bpe = self.bpe_collator.process_batch_texts(raw_texts, t_lens, self.device)
+            prosody_feat = prosody_feat.to(self.device, non_blocking=True)
+        if bpe_ids is not None:
+            bpe_ids = bpe_ids.to(self.device, non_blocking=True)
+            bpe_lens = bpe_lens.to(self.device, non_blocking=True)
+            char_to_bpe = char_to_bpe.to(self.device, non_blocking=True)
 
         with torch.no_grad():
             gt_prosody = self.model.prosody_codec.encode(prosody_feat).detach()
 
         B = padded_audio.shape[0]
 
-        logits, targets, _, _, _, latent_pred = self.model(
-            padded_text, padded_audio[:, :self.model.n_q], t_lens, a_lens, raw_texts=raw_texts,
+        fwd = self._compiled_forward or self.model
+        logits, targets, _, _, _, latent_pred = fwd(
+            padded_text, padded_audio[:, :self.model.n_q], t_lens, a_lens,
             phoneme_ids=ph_targets, prosody_feats=None,
             bpe_ids=bpe_ids, bpe_lens=bpe_lens, char_to_bpe=char_to_bpe,
             drop_prob=0.0
         )
 
-        a_mask = torch.arange(latent_pred.shape[-1], device=self.device).unsqueeze(0) >= a_lens.unsqueeze(1)
+        a_mask = torch.arange(latent_pred.shape[-1], device=self.device).unsqueeze(0) >= (a_lens + self.leading_sil_frames).unsqueeze(1)
         n_q = self.model.n_q
         T_audio = targets.shape[2]
         weights_ar = torch.zeros(n_q, device=self.device)
@@ -446,7 +538,7 @@ class FusionTrainer:
         rng_state = torch.random.get_rng_state()
         torch.manual_seed(0)
         n = 0
-        with torch.no_grad(), torch.amp.autocast("cuda"):
+        with torch.no_grad():
             for i, batch in enumerate(self.eval_loader):
                 if i >= max_batches:
                     break
@@ -477,21 +569,31 @@ class FusionTrainer:
         eval_max_batches = self.cfg['training'].get('eval_max_batches', 200)
 
         for epoch in range(self.start_epoch, self.cfg['training'].get('epochs', 100)):
+            self.current_epoch = epoch
             self.model.train()
             pbar = tqdm(self.loader, desc=f"Epoch {epoch} (Fusion)")
 
             for batch in pbar:
+                prof_steps = int(os.environ.get('SEEDVOX_PROFILE_STEPS', '0'))
+                prof_hold = prof_steps and pbar.n < prof_steps
+                prof = None
+                if prof_hold:
+                    prof = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU,
+                                    torch.profiler.ProfilerActivity.CUDA])
+                    prof.start()
+                step_t0 = time.time()
                 self.optimizer.zero_grad()
                 with torch.amp.autocast("cuda"):
                     total_loss, loss_ar, loss_jepa, loss_ph, loss_cycle, loss_style, style_anchor = self._compute_loss(batch)
 
                 if not torch.isfinite(total_loss):
-                    # Skip non-finite steps: never let nan/inf grads reach the
-                    # optimizer (GradScaler would otherwise hit its min scale and
-                    # "give up", poisoning every weight). A nan plan/prediction is
-                    # usually transient and self-corrects next step.
+                    # Skip non-finite steps: a nan plan/prediction is usually
+                    # transient and self-corrects next step.
                     self.scheduler.step()
                     self.global_step += 1
+                    if prof is not None:
+                        prof.stop()
                     continue
 
                 self.scaler.scale(total_loss).backward()
@@ -507,21 +609,33 @@ class FusionTrainer:
                     with torch.no_grad():
                         ema_decay_per_step = self.ema_decay ** ema_every
                         for param, ema_param in zip(self.model.parameters(), self.ema_model.parameters()):
-                            ema_param.lerp_(param, 1 - ema_decay_per_step)
+                            ema_param.lerp_(param.detach().half(), 1 - ema_decay_per_step)
 
                 self.global_step += 1
 
-                pbar.set_postfix(
-                    ar=f"{loss_ar.item():.3f}",
-                    jepa=f"{loss_jepa.item() if isinstance(loss_jepa, torch.Tensor) else loss_jepa:.3f}",
-                    ph=f"{loss_ph.item() if isinstance(loss_ph, torch.Tensor) else loss_ph:.3f}",
-                    cyc=f"{loss_cycle.item():.3f}" if isinstance(loss_cycle, torch.Tensor) else "0.000",
-                    sty=f"{loss_style.item():.3f}" if isinstance(loss_style, torch.Tensor) else "0.000",
-                    anc=f"{style_anchor.item():.3f}" if style_anchor is not None else "---",
-                    total=f"{total_loss.item():.3f}"
-                )
+                if prof is not None:
+                    prof.stop()
+                    print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=22), flush=True)
+                    del prof
 
-                if self.global_step % self.cfg['training'].get('log_every', 10) == 0:
+                save_every = self.cfg['training'].get('save_every', 0)
+                if save_every > 0 and self.global_step % save_every == 0:
+                    rpath = f"checkpoints/{output_prefix}_resume.pt"
+                    self._save_checkpoint(rpath, self.current_epoch)
+                    print(f"[step {self.global_step}] periodic resume checkpoint -> {rpath}", flush=True)
+
+                log_every = self.cfg['training'].get('log_every', 10)
+                if self.global_step % log_every == 0:
+                    pbar.set_postfix(
+                        ar=f"{loss_ar.item():.3f}",
+                        jepa=f"{loss_jepa.item() if isinstance(loss_jepa, torch.Tensor) else loss_jepa:.3f}",
+                        ph=f"{loss_ph.item() if isinstance(loss_ph, torch.Tensor) else loss_ph:.3f}",
+                        cyc=f"{loss_cycle.item():.3f}" if isinstance(loss_cycle, torch.Tensor) else "0.000",
+                        sty=f"{loss_style.item():.3f}" if isinstance(loss_style, torch.Tensor) else "0.000",
+                        anc=f"{style_anchor.item():.3f}" if style_anchor is not None else "---",
+                        total=f"{total_loss.item():.3f}"
+                    )
+
                     self.writer.add_scalar("train/loss", total_loss.item(), self.global_step)
                     self.writer.add_scalar("train/loss_jepa", loss_jepa.item() if isinstance(loss_jepa, torch.Tensor) else loss_jepa, self.global_step)
                     self.writer.add_scalar("train/loss_ph", loss_ph.item() if isinstance(loss_ph, torch.Tensor) else loss_ph, self.global_step)
@@ -532,17 +646,11 @@ class FusionTrainer:
                     self.writer.add_scalar("train/lr", self.scheduler.get_last_lr()[0], self.global_step)
 
             ckpt_path = f"checkpoints/{output_prefix}_epoch_{epoch}.pt"
-            torch.save({
-                'model': self.model.state_dict(),
-                'ema_model': self.ema_model.state_dict(),
-                'optimizer': self.optimizer.state_dict(),
-                'scheduler': self.scheduler.state_dict(),
-                'scaler': self.scaler.state_dict(),
-                'step': self.global_step,
-                'epoch': epoch + 1,
-                'config': self.cfg
-            }, ckpt_path)
-            torch.save(self.model.state_dict(), f"checkpoints/{output_prefix}_latest.pt")
+            self._save_checkpoint(ckpt_path, epoch + 1)
+            latest_path = f"checkpoints/{output_prefix}_latest.pt"
+            tmp_latest = latest_path + ".tmp"
+            torch.save(self.model.state_dict(), tmp_latest)
+            os.replace(tmp_latest, latest_path)
             print(f"Epoch {epoch} finished. Checkpoint: {ckpt_path}")
             torch.cuda.empty_cache()
 

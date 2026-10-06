@@ -133,6 +133,7 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
         self._use_contrastive_duration = config['model'].get('use_contrastive_duration', True)
         
         cfg = config['model']
+        self.cfg_full = config
         self.jepa_planner = JEPAProsodyPlanner(
             dim=self.dim,
             num_heads=cfg.get('jepa_heads', 8),
@@ -505,6 +506,39 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
         logits, targets, latent_pred = self.forward_with_context(context, ctx_mask, audio_tokens, audio_lens, speaker_emb=spk_vec, prosody_emb=prs_emb)
         return logits, targets, ph_logits, jepa_loss, contrastive_loss, latent_pred
 
+    def _apply_decoder_runs(self, x, context, ctx_mask, positions, spk_for_adaln, mono_bias, need_attn):
+        """Apply the shared decoder stack `decoder_loops` times (weight-tied
+        recurrent / universal depth). `need_attn` keeps the first layer's
+        cross-attention map of the LAST run (used by the monotone pointer).
+        Positions are the same on every run so each loop sees the same causal
+        mask / RoPE positions, exactly like a weight-tied stack."""
+        is_pre_norm = self.decoder_layers[0].pre_norm if len(self.decoder_layers) > 0 else True
+        attn_weights_0 = None
+        for _ in range(getattr(self, 'decoder_loops', 1)):
+            for layer_i, layer in enumerate(self.decoder_layers):
+                if is_pre_norm:
+                    x = x + layer.self_attn(layer.norm1(x), positions=positions)
+                    ca = layer.cross_attn(layer.norm2(x), kv_input=context, kv_mask=ctx_mask, mono_bias=mono_bias, return_attn=(layer_i == 0 and need_attn))
+                    if layer_i == 0 and need_attn:
+                        x = x + ca[0]; attn_weights_0 = ca[1]
+                    else:
+                        x = x + ca
+                    if spk_for_adaln is not None:
+                        x = layer.speaker_adaLN(x, spk_for_adaln)
+                    x = x + layer.ff(layer.norm3(x))
+                else:
+                    x_self = layer.self_attn(x, positions=positions)
+                    x = layer.norm1(x + x_self)
+                    ca = layer.cross_attn(x, kv_input=context, kv_mask=ctx_mask, mono_bias=mono_bias, return_attn=(layer_i == 0 and need_attn))
+                    if layer_i == 0 and need_attn:
+                        x = layer.norm2(x + ca[0]); attn_weights_0 = ca[1]
+                    else:
+                        x = layer.norm2(x + ca)
+                    if spk_for_adaln is not None:
+                        x = layer.speaker_adaLN(x, spk_for_adaln)
+                    x = layer.norm3(x + layer.ff(x))
+        return x, attn_weights_0
+
     @torch.no_grad()
     def sample(self, text, text_lens, ref_audio=None, ref_lens=None, max_steps=1000, temp=0.1, curr_n_q=None, raw_texts=None, top_k=0, top_p=0.9, use_speaker=None, use_prosody=None, cfg_scale=1.0,
                bpe_ids=None, bpe_lens=None, char_to_bpe=None, char_lens=None, phoneme_ids=None, drop_prob=0.0,
@@ -574,8 +608,28 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
 
         generated = []
         curr_step_toks = torch.full((B, self.n_q, 1), self.SOA_ID, device=device, dtype=torch.long)
+        start_soa = curr_step_toks
+
+        # Leading-silence runway: when trained with leading_sil_codes, the AR
+        # targets at positions 0..S-1 are the real silence codec codes. Sampling
+        # mirrors that: run the model for S warmup steps at the real silence codes
+        # (so streaming KV caches / RoPE positions stay consistent) and inject
+        # their emissions verbatim; autoregressive sampling of content begins at
+        # step S, exactly aligned with the training target grid.
+        sil_codes = self._ensure_leading_sil_codes()
+        sil_len = sil_codes.shape[1] if sil_codes is not None else 0
+        core_sil = sil_codes[None].expand(B, -1, -1) if sil_codes is not None else None
+        cfg_sil = core_sil.repeat(2, 1, 1) if (sil_codes is not None and cfg_scale != 1.0) else None
         
-        streams = [layer.self_attn.streaming(B_eff) for layer in self.decoder_layers]
+        # Recurrent looped depth (decoder_loops > 1) re-enters the SAME self-attn
+        # modules several times per token, which would double-append the streaming
+        # ring KV cache. For looped depth we recompute the whole (short) sequence per
+        # step instead; the streaming fast path is only valid for decoder_loops == 1.
+        looped_depth = getattr(self, 'decoder_loops', 1) > 1
+        if looped_depth:
+            streams = []
+        else:
+            streams = [layer.self_attn.streaming(B_eff) for layer in self.decoder_layers]
         is_pre_norm = self.decoder_layers[0].pre_norm if len(self.decoder_layers) > 0 else True
         
         # Monotone attention pointer: (B,) relative text-frame index, non-decreasing.
@@ -585,8 +639,14 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
         try:
             for layer_stream in streams: layer_stream.__enter__()
             for t in range(max_steps):
+                is_warm = sil_len > 0 and t < sil_len
                 pos_tensor.fill_(t)
-                in_toks = curr_step_toks if cfg_scale == 1.0 else curr_step_toks.repeat(2, 1, 1)
+                if is_warm and cfg_scale == 1.0:
+                    in_toks = core_sil[:, :, t:t + 1]
+                elif is_warm:
+                    in_toks = cfg_sil[:, :, t:t + 1]
+                else:
+                    in_toks = curr_step_toks if cfg_scale == 1.0 else curr_step_toks.repeat(2, 1, 1)
                 step_emb = self.audio_prenet(self.audio_norm(
                     _sum_embeddings(self.audio_embs, in_toks, self.n_q)
                 ))
@@ -614,33 +674,35 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                     mono_bias = mono_bias.unsqueeze(1)
 
                 attn_weights_0 = None
-                for layer_i, layer in enumerate(self.decoder_layers):
-                    if is_pre_norm:
-                        x = x + layer.self_attn(layer.norm1(x), positions=pos_tensor)
-                        ca = layer.cross_attn(layer.norm2(x), kv_input=context, kv_mask=ctx_mask, mono_bias=mono_bias, return_attn=(layer_i == 0 and mono_slack > 0))
-                        if layer_i == 0 and mono_slack > 0:
-                            x = x + ca[0]; attn_weights_0 = ca[1]
-                        else:
-                            x = x + ca
-                        if spk_for_adaln is not None:
-                            x = layer.speaker_adaLN(x, spk_for_adaln)
-                        x = x + layer.ff(layer.norm3(x))
-                    else:
-                        x_self = layer.self_attn(x, positions=pos_tensor)
-                        x = layer.norm1(x + x_self)
-                        ca = layer.cross_attn(x, kv_input=context, kv_mask=ctx_mask, mono_bias=mono_bias, return_attn=(layer_i == 0 and mono_slack > 0))
-                        if layer_i == 0 and mono_slack > 0:
-                            x = layer.norm2(x + ca[0]); attn_weights_0 = ca[1]
-                        else:
-                            x = layer.norm2(x + ca)
-                        if spk_for_adaln is not None:
-                            x = layer.speaker_adaLN(x, spk_for_adaln)
-                        x = layer.norm3(x + layer.ff(x))
+                if looped_depth:
+                    # Weight-tied looped depth: recompute the full sequence through
+                    # the shared stack `decoder_loops` times, then take the LAST
+                    # column as this step's hidden state (equal to the streaming
+                    # output since self-attn is causal over absolute positions).
+                    seq_toks = start_soa
+                    if generated:
+                        seq_toks = torch.cat([start_soa] + generated, dim=-1)
+                    seq_emb = self.audio_prenet(self.audio_norm(
+                        _sum_embeddings(self.audio_embs, seq_toks, self.n_q)
+                    ))
+                    if cfg_scale != 1.0:
+                        seq_emb = seq_emb.repeat(2, 1, 1)
+                    seq_pos = torch.arange(seq_emb.shape[1], device=device, dtype=torch.long).view(1, -1)
+                    x, attn_weights_0 = self._apply_decoder_runs(
+                        seq_emb, context, ctx_mask, seq_pos, spk_for_adaln, mono_bias, mono_slack > 0
+                    )
+                    if mono_slack > 0:
+                        attn_weights_0 = attn_weights_0[:, :, -1:, :]
+                    x = x[:, -1:, :]
+                else:
+                    x, attn_weights_0 = self._apply_decoder_runs(
+                        x, context, ctx_mask, pos_tensor, spk_for_adaln, mono_bias, mono_slack > 0
+                    )
 
                 # Advance monotone pointer from cond-row attention center (non-decreasing).
                 # Argmax (not mean): lets the window slide forward only when the model
                 # actually looks ahead, and dwell freely otherwise.
-                if mono_slack > 0 and attn_weights_0 is not None:
+                if not is_warm and mono_slack > 0 and attn_weights_0 is not None:
                     text_len = kv_len - offset
                     if text_len > 0:
                         cond_w = attn_weights_0[:B].mean(dim=1)[:, 0, offset:]  # (B, text_len)
@@ -652,56 +714,67 @@ class JEPAProsodyHybridModel(JEPAProsodyBase):
                     x_cond, x_uncond = x.chunk(2, dim=0)
                     x = x_uncond + cfg_scale * (x_cond - x_uncond)
                 
-                t_in_base = x
-                step_toks = []
-                prev_tok = None
-                
-                # Fix: Initialize streaming with the actual batch size of t_in_base (B)
-                current_batch_size = t_in_base.shape[0]
-                hist = torch.cat(generated, dim=-1) if generated else None
-                with self.dep_transformer.streaming(current_batch_size):
-                    for k in range(self.n_q):
-                        if k < curr_n_q:
-                            level_ctx = torch.cat([t_in_base, self.dep_level_emb[:, k:k+1, :].expand(t_in_base.shape[0], -1, -1)], dim=-1)
-                            dep_input = self.dep_in[k](level_ctx) if k == 0 or prev_tok is None else self.dep_in[k](level_ctx) + self.dep_emb[k-1](prev_tok)
-                            dep_out = self.dep_transformer(dep_input)
-                            if dep_prs is not None:
-                                dep_out = self.dep_prosody_adaLN(dep_out, dep_prs)
-                            if dep_spk is not None:
-                                dep_out = self.dep_speaker_adaLN(dep_out, dep_spk)
-                            l = self.dep_layers[k](dep_out) / max(temp, 1e-6)
-                            # Use the model's card + 3 as the vocabulary size for the view
-                            l = l.view(current_batch_size, self.card + 3)
-                            if k > 0: l[:, self.SOA_ID:self.EOA_ID+1] = -float('inf')
-                            if rep_penalty > 1.0 and hist is not None and hist.shape[-1] > 0:
-                                pen = torch.zeros_like(l)
-                                pen.scatter_add_(1, hist[:, k, :], torch.ones((current_batch_size, hist.shape[-1]), device=l.device, dtype=l.dtype))
-                                l = torch.where(pen > 0, l / rep_penalty, l)
-                            if top_k > 0:
-                                v, _ = torch.topk(l, min(top_k, l.size(-1)))
-                                l[l < v[:, [-1]]] = -float('inf')
-                            if top_p < 1.0:
-                                sorted_logits, sorted_indices = torch.sort(l, descending=True)
-                                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                                sorted_indices_to_remove = cumulative_probs > top_p
-                                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                                sorted_indices_to_remove[..., 0] = 0
-                                remove_mask = torch.zeros_like(l)
-                                remove_mask.scatter_(1, sorted_indices, sorted_indices_to_remove.to(l.dtype))
-                                l[remove_mask.bool()] = float('-inf')
-                            if min_p > 0.0:
-                                probs = F.softmax(l, dim=-1)
-                                min_thresh = min_p * probs.max(dim=-1, keepdim=True).values
-                                l = torch.where(probs < min_thresh, torch.full_like(l, -float('inf')), l)
-                            next_tok = torch.multinomial(F.softmax(l, dim=-1), 1)
-                            step_toks.append(next_tok)
-                            prev_tok = next_tok
-                        else:
-                            step_toks.append(torch.zeros((current_batch_size, 1), device=device, dtype=torch.long))
-                
-                curr_step_toks = torch.stack(step_toks, 1)
-                if curr_step_toks[0, 0, 0] == self.EOA_ID: break
-                generated.append(curr_step_toks)
+                if not is_warm:
+                    t_in_base = x
+                    step_toks = []
+                    prev_tok = None
+                    
+                    # Fix: Initialize streaming with the actual batch size of t_in_base (B)
+                    current_batch_size = t_in_base.shape[0]
+                    hist = torch.cat(generated, dim=-1) if generated else None
+                    with self.dep_transformer.streaming(current_batch_size):
+                        for k in range(self.n_q):
+                            if k < curr_n_q:
+                                level_ctx = torch.cat([t_in_base, self.dep_level_emb[:, k:k+1, :].expand(t_in_base.shape[0], -1, -1)], dim=-1)
+                                dep_input = self.dep_in[k](level_ctx) if k == 0 or prev_tok is None else self.dep_in[k](level_ctx) + self.dep_emb[k-1](prev_tok)
+                                dep_out = self.dep_transformer(dep_input)
+                                if dep_prs is not None:
+                                    dep_out = self.dep_prosody_adaLN(dep_out, dep_prs)
+                                if dep_spk is not None:
+                                    dep_out = self.dep_speaker_adaLN(dep_out, dep_spk)
+                                l = self.dep_layers[k](dep_out) / max(temp, 1e-6)
+                                # Use the model's card + 3 as the vocabulary size for the view
+                                l = l.view(current_batch_size, self.card + 3)
+                                if k > 0: l[:, self.SOA_ID:self.EOA_ID+1] = -float('inf')
+                                if rep_penalty > 1.0 and hist is not None and hist.shape[-1] > 0:
+                                    pen = torch.zeros_like(l)
+                                    pen.scatter_add_(1, hist[:, k, :], torch.ones((current_batch_size, hist.shape[-1]), device=l.device, dtype=l.dtype))
+                                    l = torch.where(pen > 0, l / rep_penalty, l)
+                                if top_k > 0:
+                                    v, _ = torch.topk(l, min(top_k, l.size(-1)))
+                                    l[l < v[:, [-1]]] = -float('inf')
+                                if top_p < 1.0:
+                                    sorted_logits, sorted_indices = torch.sort(l, descending=True)
+                                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                                    sorted_indices_to_remove = cumulative_probs > top_p
+                                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                                    sorted_indices_to_remove[..., 0] = 0
+                                    remove_mask = torch.zeros_like(l)
+                                    remove_mask.scatter_(1, sorted_indices, sorted_indices_to_remove.to(l.dtype))
+                                    l[remove_mask.bool()] = float('-inf')
+                                if min_p > 0.0:
+                                    probs = F.softmax(l, dim=-1)
+                                    min_thresh = min_p * probs.max(dim=-1, keepdim=True).values
+                                    l = torch.where(probs < min_thresh, torch.full_like(l, -float('inf')), l)
+                                next_tok = torch.multinomial(F.softmax(l, dim=-1), 1)
+                                step_toks.append(next_tok)
+                                prev_tok = next_tok
+                            else:
+                                step_toks.append(torch.zeros((current_batch_size, 1), device=device, dtype=torch.long))
+                    
+                    curr_step_toks = torch.stack(step_toks, 1)
+                    if curr_step_toks[0, 0, 0] == self.EOA_ID: break
+                else:
+                    # Warmup step: the codec-silence code is the taught emission;
+                    # the model's own prediction at this position is discarded.
+                    curr_step_toks = (core_sil if cfg_scale == 1.0 else cfg_sil)[:, :, t:t + 1]
+                # Looped depth rebuilds the input sequence from `generated` each step
+                # (B-sized); with CFG the batch was doubled only for attention, so
+                # keep only the conditional half in the running history.
+                if looped_depth and cfg_scale != 1.0:
+                    generated.append(curr_step_toks[:B])
+                else:
+                    generated.append(curr_step_toks)
         finally:
             for layer_stream in reversed(streams): layer_stream.__exit__(None, None, None)
         return torch.cat(generated, -1) if generated else None, None

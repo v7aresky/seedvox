@@ -1,0 +1,200 @@
+{
+  "model": {
+    "dim": 512,
+    "n_q": 16,
+    "card": 2048,
+    "num_heads": 8,
+    "num_layers": 6,
+    "dec_num_layers": 6,
+    "decoder_loops": 2,
+    "num_speaker_latents": 16,
+    "num_prosody_latents": 32,
+    "num_prosody_tokens": 32,
+    "prosody_codec_path": "checkpoints/prosody_codec.pt",
+    "hidden_scale": 4.0,
+    "text_encoder_layers": 4,
+    "jepa_layers": 2,
+    "jepa_heads": 4,
+    "jepa_n_q": 8,
+    "depformer_num_layers": 10,
+    "num_codebooks": 16,
+    "use_pre_norm": true,
+    "use_contrastive_duration": true,
+    "use_speaker": true,
+    "use_prosody": true,
+    "use_jepa_planner": true,
+    "use_phonetic": true,
+    "use_explicit_planner": true,
+    "use_film": true,
+    "planner_learned_std": true,
+    "planner_std_init": 0.3,
+    "planner_std_min": 0.05,
+    "planner_std_max": 2.0,
+    "prosody_temperature": 1.0,
+    "planner_contrastive_weight": 0.2,
+    "planner_anchor_weight": 0.0,
+    "planner_std_weight": 0.05,
+    "decoder_prosody_source": "mix",
+    "decoder_gt_prob": 0.5,
+    "gradient_checkpointing": false,
+    "bpe_encoder": {
+      "enabled": true,
+      "bpe_layers": 2,
+      "use_pretrained_embeddings": true,
+      "freeze_bpe_embeddings": false,
+      "combination": "add"
+    },
+    "use_style": false,
+    "num_style_tokens": 16,
+    "style_drop": 0.2,
+    "style_gt_prob": 0.85,
+    "style_anchor_weight": 0.25,
+    "style_diversity_weight": 0.1
+  },
+  "training": {
+    "batch_size": 6,
+    "num_workers": 4,
+    "max_audio_len_tokens": 187,
+    "ph_planner_weight": 0.5,
+    "lr": 5e-05,
+    "ph_pretrain_path": "pretrained_models/phonetic_head_pretrain.pt",
+    "param_groups": [
+      {
+        "keywords": [
+          "style_emb",
+          "style_bank",
+          "style_head",
+          "jepa_planner.style_adaLN"
+        ],
+        "lr": 0.0003
+      },
+      {
+        "keywords": [
+          "dep_prosody_adaLN",
+          "dep_speaker_adaLN",
+          "film_prs",
+          "speaker_adapter",
+          "prosody_bottleneck",
+          "latent_regressor",
+          "null_prosody",
+          "null_speaker"
+        ],
+        "lr": 0.0003
+      },
+      {
+        "keywords": [
+          "dep_transformer",
+          "dep_layers",
+          "dep_in",
+          "decoder_layers",
+          "dep_speaker_adaLN",
+          "dep_prosody_adaLN"
+        ],
+        "lr": 0.0001
+      },
+      {
+        "keywords": [
+          "text_emb",
+          "text_encoder"
+        ],
+        "lr": 1e-06
+      },
+      {
+        "keywords": [
+          "phonetic_planner",
+          "ph_decoder_emb"
+        ],
+        "lr": 1e-06
+      },
+      {
+        "keywords": [
+          "film_phn"
+        ],
+        "lr": 1e-05
+      }
+    ],
+    "warmup_steps": 2000,
+    "epochs": 200,
+    "eval_every": 5,
+    "eval_max_batches": 200,
+    "log_every": 10,
+    "save_every": 500,
+    "lr_min": 1e-06,
+    "train_tokens_path": [
+      "../autovoc/dataset/train_tokens_libri_prosody_16q_prosody_codec.pt",
+      "../autovoc/train_tokens_globe_prosody_codec.pt",
+      "../autovoc/dataset/hifitts/train_tokens_hifitts_prosody_codec.pt",
+      "../autovoc/dataset/train_tokens_prosody_16q_prosody_codec.pt",
+      "../autovoc/dataset/train_tokens_dailytalk_prosody_16q_prosody_codec.pt"
+    ],
+    "output_prefix": "seedvox_light_fusion_r6_16q_multicorpus",
+    "jepa_weight": 1.0,
+    "ph_weight": 0.5,
+    "dur_weight": 0.08,
+    "planner_cycle_weight": 0.5,
+    "cycle_anchor_weight": 0.5,
+    "grad_clip": 10.0,
+    "val_ratio": 0.01,
+    "ema_decay": 0.999,
+    "ema_update_every": 10,
+    "use_precomputed_phonemes": true,
+    "latent_weight": 0.0,
+    "compile": false,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "mimi_lora_rank": 8,
+    "mimi_lora_alpha": 16,
+    "mel_weight": 45.0,
+    "stft_weight": 0.0,
+    "recon_weight": 0.1,
+    "curriculum_n_q": {
+      "enabled": false,
+      "start_codebooks": 4,
+      "ramp_steps": 50000
+    },
+    "style_weight": 0.1,
+    "label_smoothing": {
+      "enabled": true,
+      "profile": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.1
+      ]
+    },
+    "level_weights": [
+      1.5,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5
+    ],
+    "leading_silence": {
+      "audio_frames": 4,
+      "phone_pause": true
+    }
+  }
+}

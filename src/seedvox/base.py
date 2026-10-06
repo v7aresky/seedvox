@@ -84,6 +84,11 @@ class JEPAProsodyBase(StreamingContainer):
             CrossAttentionDecoderLayer(self.dim, cfg['num_heads'], cfg['hidden_scale'], pre_norm=use_pre_norm) 
             for _ in range(cfg['dec_num_layers'])
         ])
+        # Recurrent looped depth ("universal transformer" weight tying): the SAME
+        # decoder stack is applied `decoder_loops` times, so effective depth =
+        # dec_num_layers * decoder_loops with zero extra parameters. Default 1 keeps
+        # existing checkpoints and behavior untouched.
+        self.decoder_loops = int(cfg.get('decoder_loops', 1))
         
         self.dep_level_emb = nn.Parameter(torch.randn(1, self.n_q, self.dim) * 0.02)
         self.dep_in = nn.ModuleList([nn.Sequential(
@@ -139,14 +144,45 @@ class JEPAProsodyBase(StreamingContainer):
         t_mask = (valid.unsqueeze(2) & valid.unsqueeze(1)).unsqueeze(1)
         return self.text_encoder(self.text_emb(text_in), mask=t_mask), text_in
     
+    def _ensure_leading_sil_codes(self):
+        """Lazy self-attach of the leading-silence runway codes (cache read).
+
+        Trainer and the inference entry points attach eagerly; this guarantee is
+        the safety net so any forward/sample caller runs the SAME training-time
+        protocol instead of silently omitting the runway. No-op when the config
+        has the feature off."""
+        sil = getattr(self, 'leading_sil_codes', None)
+        if sil is not None:
+            return sil
+        full = getattr(self, 'cfg_full', None)
+        if not isinstance(full, dict):
+            return None
+        nq_cfg = (full.get('model') or {}).get('n_q')
+        if not nq_cfg or nq_cfg != self.n_q:
+            return None
+        frames = int(((full.get('training') or {}).get('leading_silence') or {}).get('audio_frames', 0))
+        if frames <= 0:
+            return None
+        from explicit_pros_phon_planner.utils import compute_silence_codes
+        import os
+        dev = next(iter(self.parameters())).device
+        cache_path = os.path.join('checkpoints', f'silence_runway_{nq_cfg}q_{frames}f.pt')
+        self.leading_sil_codes = compute_silence_codes(
+            dev, n_q=nq_cfg, frames=frames, cache_path=cache_path).to(dev)
+        return self.leading_sil_codes
+
     def forward_with_context(self, context, ctx_mask, audio_tokens, audio_lens, speaker_emb=None, prosody_emb=None):
         B, K, Ta = audio_tokens.shape
         device = audio_tokens.device
-        a_in = torch.full((B, K, Ta + 1), self.SOA_ID, device=device, dtype=torch.long)
-        a_in[:, :, 1:] = audio_tokens
-        a_tgt = torch.full((B, K, Ta + 1), -1, device=device, dtype=torch.long)
-        a_tgt[:, :, :Ta] = audio_tokens
-        a_tgt[torch.arange(B, device=device), :, audio_lens] = self.EOA_ID
+        sil = self._ensure_leading_sil_codes()
+        S = sil.shape[1] if sil is not None else 0
+        a_in = torch.full((B, K, Ta + 1 + S), self.SOA_ID, device=device, dtype=torch.long)
+        a_in[:, :, 1:1 + S] = sil[None]
+        a_in[:, :, 1 + S:] = audio_tokens
+        a_tgt = torch.full((B, K, Ta + 1 + S), -1, device=device, dtype=torch.long)
+        a_tgt[:, :, :S] = sil[None]
+        a_tgt[:, :, S:S + Ta] = audio_tokens
+        a_tgt[torch.arange(B, device=device), :, S + audio_lens.long()] = self.EOA_ID
             
         a_emb = self.audio_prenet(self.audio_norm(
             _sum_embeddings(self.audio_embs, a_in, K)
@@ -155,11 +191,13 @@ class JEPAProsodyBase(StreamingContainer):
         x = a_emb
         positions = torch.arange(a_emb.shape[1], device=device).unsqueeze(0)
         if self.use_grad_ckpt and self.training:
-            for layer in self.decoder_layers:
-                x = checkpoint(layer, x, context, ctx_mask, positions, speaker_emb, use_reentrant=False)
+            for _ in range(self.decoder_loops):
+                for layer in self.decoder_layers:
+                    x = checkpoint(layer, x, context, ctx_mask, positions, speaker_emb, use_reentrant=False)
         else:
-            for layer in self.decoder_layers:
-                x = layer(x, context, kv_mask=ctx_mask, positions=positions, speaker_emb=speaker_emb)
+            for _ in range(self.decoder_loops):
+                for layer in self.decoder_layers:
+                    x = layer(x, context, kv_mask=ctx_mask, positions=positions, speaker_emb=speaker_emb)
             
         T_a_in = x.shape[1]
         flat_out = x.reshape(B * T_a_in, 1, self.dim).transpose(0, 1)
@@ -183,7 +221,11 @@ class JEPAProsodyBase(StreamingContainer):
             else:
                 dep_inputs.append(self.dep_in[k](level_ctx) + self.dep_emb[k-1](flat_tgt[:, k-1]))
         
-        d_out = self.dep_transformer(torch.stack(dep_inputs, 2).view(B * T_a_in, self.n_q, -1))
+        dep_inputs = torch.stack(dep_inputs, 2).view(B * T_a_in, self.n_q, -1)
+        if self.use_grad_ckpt and self.training:
+            d_out = checkpoint(self.dep_transformer, dep_inputs, use_reentrant=False)
+        else:
+            d_out = self.dep_transformer(dep_inputs)
         if dep_prs is not None:
             d_out = self.dep_prosody_adaLN(d_out, dep_prs)
         if dep_spk is not None:

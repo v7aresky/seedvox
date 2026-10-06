@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SeedVox — Speech that plans before it speaks</title>
+<style>
+  :root{
+    --bg:#0f1720; --panel:#16212e; --panel2:#1c2a3a; --line:#2a3a4e;
+    --ink:#e8eef7; --muted:#9fb3c8; --dim:#6f8499;
+    --accent:#0ca678; --accent2:#5aa9ff; --warn:#ffcf5a; --rose:#ff7a8a;
+    --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+    font-size:clamp(13px,2.0vh,19px);line-height:1.45;overflow:hidden}
+  .deck{height:100vh;position:relative}
+  .slide{position:absolute;inset:0;padding:5.5vh 6vw;display:flex;flex-direction:column;
+    justify-content:center;opacity:0;transform:translateX(24px);transition:.45s ease;
+    pointer-events:none;overflow:auto}
+  .slide.active{opacity:1;transform:none;pointer-events:auto}
+  .slide.vstack{justify-content:flex-start}
+  .time{position:absolute;top:2.4vh;right:6vw;z-index:5;color:var(--dim);
+    font-family:var(--mono);font-size:.72rem;letter-spacing:.06em}
+  .progress{position:fixed;top:0;left:0;height:4px;background:var(--accent);z-index:60}
+  .counter{position:fixed;bottom:14px;right:20px;z-index:60;color:var(--dim);
+    font-family:var(--mono);font-size:.8rem;letter-spacing:.05em}
+  .brand{position:fixed;top:14px;left:20px;z-index:60;color:var(--muted);
+    font-size:.85rem;font-weight:600;letter-spacing:.06em}
+  .brand b{color:var(--accent)}
+  .nav{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:60;
+    display:flex;gap:8px}
+  .nav button{background:var(--panel);color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:6px 14px;cursor:pointer;font-size:.85rem}
+  .nav button:hover{border-color:var(--accent);color:var(--accent)}
+  .dots{position:fixed;right:22px;top:50%;transform:translateY(-50%);z-index:60;
+    display:flex;flex-direction:column;gap:8px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--line);cursor:pointer;border:none}
+  .dot.active{background:var(--accent)}
+  h1{font-size:clamp(1.6rem,5vh,3rem);margin:.1em 0;letter-spacing:-.01em;line-height:1.1}
+  h2{font-size:clamp(1.15rem,3.3vh,2rem);margin:.1em 0 .4em;color:var(--accent);
+    letter-spacing:-.01em}
+  h3{font-size:1rem;margin:1em 0 .35em;color:var(--accent2)}
+  .lead{font-size:clamp(.92rem,2.3vh,1.22rem);color:var(--muted);max-width:64ch}
+  .kicker{color:var(--accent2);font-weight:700;letter-spacing:.14em;text-transform:uppercase;font-size:.8em}
+  .grid{display:grid;gap:13px;margin-top:.9em}
+  .g3{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+  .g4{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:16px 18px}
+  .card h4{margin:0 0 .3em;color:var(--ink);font-size:1rem}
+  .card p{margin:.2em 0;color:var(--muted);font-size:.9em}
+  .card .big{font-size:1.35rem;font-weight:800;color:var(--accent)}
+  .card .hl{color:var(--accent);font-weight:700}
+  h4.accent{color:var(--accent)}
+  h4.hl{color:var(--accent)}
+  .tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);
+    border-radius:999px;padding:.15em .8em;font-size:.76em;color:var(--accent2);
+    margin:.15em .25em .15em 0;font-family:var(--mono)}
+  .mono{font-family:var(--mono)}
+  code{font-family:var(--mono);background:var(--panel2);color:var(--accent2);
+    padding:.05em .35em;border-radius:5px;font-size:.92em}
+  table{width:100%;border-collapse:collapse;margin-top:.6em;font-size:.9em}
+  th,td{text-align:left;padding:.45em .6em;border-bottom:1px solid var(--line)}
+  th{color:var(--accent2);font-weight:600;letter-spacing:.02em}
+  td.num,th.num{font-family:var(--mono);text-align:right}
+  .up{color:var(--accent)} .mid{color:var(--warn)} .low{color:var(--rose)}
+  .callout{border-left:4px solid var(--accent);background:var(--panel);
+    padding:.85em 1.1em;border-radius:0 12px 12px 0;color:var(--muted);margin:.9em 0}
+  .callout b{color:var(--ink)}
+  .callout.warn{border-color:var(--warn)}
+  .flow{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);
+    padding:.85em 1em;border-radius:12px;color:var(--ink);font-size:.9em;line-height:1.7;
+    overflow-x:auto;white-space:pre}
+  .flow .hl{color:var(--accent);font-weight:700}
+  .mermaid{background:var(--panel2);border:1px solid var(--line);
+    border-radius:12px;padding:.55em .7em .7em;overflow:auto;font-size:.9em;cursor:grab;position:relative}
+  .mermaid.panning{cursor:grabbing}
+  .mermaid svg{display:block;max-width:none}
+  .mermaid .mzb{position:sticky;top:0;left:0;z-index:5;display:flex;align-items:center;gap:5px;
+    width:max-content;padding:4px 7px;margin:-4px 0 8px;background:var(--panel);
+    border:1px solid var(--line);border-radius:8px;cursor:default}
+  .mermaid .mzb button{background:var(--body);color:var(--muted);border:1px solid var(--line);
+    border-radius:6px;padding:1px 9px;font:600 12.5px/1.6 var(--mono,monospace);cursor:pointer}
+  .mermaid .mzb button:hover{color:var(--accent);border-color:var(--accent)}
+  .mermaid .mzb span{color:var(--dim);font-size:11.5px;min-width:40px;text-align:center}
+  .flow .ok{color:#7dffb0}.flow .tr{color:#ffa94d}.flow .tl{color:#7dffb0}.flow .ac{color:#5aa9ff}.flow .dim{color:var(--dim)}
+  ul{margin:.35em 0;padding-left:1.2em}
+  li{margin:.28em 0;color:var(--muted)}
+  li b{color:var(--ink)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:900px){.two{grid-template-columns:1fr}}
+  .foot{position:absolute;bottom:1.3vh;left:6vw;color:var(--dim);font-size:.78em}
+  .sample{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:16px 20px;margin:.9em 0}
+  .sample audio{width:100%;height:46px}
+  .sample .text{font-size:.92em;font-style:italic;color:var(--ink);margin:0 0 .5em}
+  .sample .desc{font-size:.86em;color:var(--muted);margin:0}
+  .vscard{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:12px 16px;margin:.4em 0}
+</style>
+</head>
+<body>
+<div class="progress" id="progress"></div>
+<div class="brand">🌱 <b>SeedVox</b> — speech that plans before it speaks</div>
+<div class="counter" id="counter">1 / N</div>
+<div class="dots" id="dots"></div>
+
+<div class="deck" id="deck">
+
+<!-- 1 · TITLE -->
+<section class="slide">
+  <div class="time">0:20</div>
+  <div class="kicker">Technical deep-dive · speech synthesis</div>
+  <h1>SeedVox</h1>
+  <h2 style="color:var(--ink)">Speech that plans before it speaks.</h2>
+  <p class="lead"><b style="color:var(--ink)">Smarter Speech AI</b> — bigger data, smarter architecture, better prosody.</p>
+  <p class="lead">Today's speech engines treat expression like a brute-force problem: a single bloated autoregressive model guesses emotion <b style="color:var(--ink)">token by token</b>. But emotion is a <b style="color:var(--ink)">global state of mind</b> that shapes an entire sentence before we even speak. SeedVox separates the <b style="color:var(--ink)">"what"</b> from the <b style="color:var(--ink)">"how"</b> — and the <b style="color:var(--ink)">"who"</b> — with structural priors, so each component learns a clean job.</p>
+  <div class="grid g3" style="margin-top:1.2em">
+    <div class="card"><h4>AR Phonetic Planner</h4><p><span class="tag">the "what"</span> Stable, hallucination-free phoneme planning &amp; acoustic anchoring.</p></div>
+    <div class="card"><h4>JEPA World Model</h4><p><span class="tag">the "how"</span> Reads the whole sentence at once, predicts a global prosody latent before generation.</p></div>
+    <div class="card"><h4>Speaker Conditioning</h4><p><span class="tag">the "who"</span> A reference clip → speaker latent re-tunes phonemes &amp; prosody to that voice via dual-FiLM — identity, not guessed.</p></div>
+    <div class="card"><h4>AR Acoustic Decoder</h4><p><span class="tag">the renderer</span> Renders <b>What + How + Who</b> into audio tokens, guided by the JEPA latent.</p></div>
+  </div>
+  <p style="color:var(--dim);margin-top:1em;font-size:.85em">Open-source research &amp; education sandbox · Apache License 2.0 · github.com/v7aresky/seedvox</p>
+</section>
+
+<!-- 2 · MOTIVATION -->
+<section class="slide">
+  <div class="time">0:30</div>
+  <h2>Motivation — against brute force</h2>
+  <p class="lead">Big labs win by scale: enormous transformers, enormous data, brute-force token-by-token meaning. SeedVox argues that <b>structure beats scale</b> at the same budget.</p>
+  <div class="card"><h4 class="accent">Structure as leverage</h4><p>Impose a principled prior: language sequencing (AR) vs. global emotional state (JEPA) separated explicitly — each component learns a clean job.</p></div>
+  <div class="callout warn" style="margin-top:1.2em"><b>The frugality thesis:</b> you don't need a giant lab's compute to get SOTA-quality voice. Split the job, bake in structure, and a single <b>RTX 5090</b> trains and runs it — real-time for interaction, fully local, fully yours. <b>Frugal, accessible, educational.</b></div>
+</section>
+
+<!-- 3 · DATA -->
+<section class="slide">
+  <div class="time">0:45</div>
+  <h2>Data — enough, not massive</h2>
+  <p class="lead"><b>Structure beats scale extends to data:</b> no proprietary corpora, no internet scrape. Five public speech sets — <b>276,529 utterances · 319.3 h</b> — pre-cooked offline, so training just streams cached rows. Roughly <b>3 orders of magnitude smaller than a big lab's data budget</b> (~1/1000th); <b>&lt;300 h unique</b> — HiFiTTS &amp; LibriTTS re-cut the same LibriVox audiobooks.</p>
+  <table>
+    <tr><th>Corpus</th><th class="num">Hours</th><th class="num">Utterances</th><th>Role</th></tr>
+    <tr><td class="mono">HiFiTTS</td><td class="num">116.0</td><td class="num">125,844</td><td>High-fidelity audiobooks — a clean acoustic backbone.</td></tr>
+    <tr><td class="mono">GLOBES</td><td class="num">104.6</td><td class="num">81,299</td><td>LibriVox excerpts — many speakers &amp; reading styles.</td></tr>
+    <tr><td class="mono">LibriTTS</td><td class="num">53.8</td><td class="num">33,113</td><td>US audiobooks — train-clean-100 subset, 247 speakers.</td></tr>
+    <tr><td class="mono">LJSpeech</td><td class="num">23.0</td><td class="num">12,500</td><td>Expressive / spontaneous utterances — the expressiveness substrate.</td></tr>
+    <tr><td class="mono">DailyTalk</td><td class="num">21.9</td><td class="num">23,773</td><td>Conversational dialogues — natural give-and-take.</td></tr>
+    <tr><td><b>Total (5 sets)</b></td><td class="num"><b>319.3 h</b></td><td class="num"><b>276,529</b></td><td><b>utterances</b></td></tr>
+  </table>
+  <div class="callout" style="margin-top:1em"><b>What typical TTS training data is:</b> <b>normalized text</b> + <b>the speech waveform</b>, a <b>speaker label</b>, often <b>dialogue context</b>, and increasingly <b>natural-language emotion / style captions</b> ("lively", "annoyed"...). SeedVox uses <b>none of the labels</b> — expression is supervised <b>directly from the audio</b> (F0/E/V → latent), so the "how" is <b>measured, not captioned</b>.</div>
+</section>
+
+<!-- 4 · ARCHITECTURE SUMMARY -->
+<section class="slide vstack">
+  <div class="time">0:45</div>
+  <h2>Architecture at a glance</h2>
+  <p class="lead">Instead of one giant network juggling everything at once, SeedVox splits the job into dedicated components:</p>
+  <pre class="mermaid">
+graph TD
+    TXT["Input text"]
+
+    subgraph CORE["SeedVox — generation path"]
+        subgraph JEPA["JEPA World Model"]
+            J["JEPA Prosody Planner (non-causal)<br/>→ global prosody latent (B, 32, dim)"]
+        end
+
+        subgraph AR["AR Backbone"]
+            A["AR Phonetic Planner<br/>text → phonemes"]
+            L["Linguistic Fusion<br/>gated cross-attn folds phonemes into text"]
+            B["AR Acoustic Decoder<br/>unified text + prosody plan → audio tokens"]
+        end
+
+        M["Mimi decoder<br/>tokens → 24 kHz waveform"]
+
+        J -.->|"prosody plan (parallel, not fused)"| B
+        A --> L --> B
+        B -->|"audio tokens"| M
+        M --> OUT["Speech audio"]
+    end
+
+    subgraph TRAIN["Training only"]
+        T["Frozen Prosody Codec &amp; Mimi encoder<br/>(F0 / E / V → latent) supervise JEPA"]
+    end
+
+    TXT --> A
+    VOI["Reference audio (optional)"] -.->|"speaker identity"| B
+    T -.->|"trains"| J
+
+    style CORE fill:#13301f,stroke:#2f9e44
+    style JEPA fill:#0f2f29,stroke:#0ca678
+    style AR fill:#13301f,stroke:#2f9e44
+    style M fill:#11304a,stroke:#5aa9ff
+    style TRAIN fill:#331f0c,stroke:#e8590c
+  </pre>
+  <p style="margin:.6em 0 .15em;font-weight:600">Mimi — the codec behind it:</p>
+  <pre class="mermaid">
+graph LR
+    %% Inputs and Outputs
+    InputWave["24kHz Audio Target"]
+    OutputWave["24kHz Reconstructed Audio"]
+
+    %% Neural Encoder Subgraph
+    subgraph Neural_Encoder["Neural encoder"]
+        direction LR
+        ConvNet_Enc["ConvNet"]
+        Feature_Dots_Enc["12.5 Hz Feature Maps"]
+        Transformer_Enc["Transformer"]
+        Enc_Out["Latent Representation"]
+
+        ConvNet_Enc --> Feature_Dots_Enc --> Transformer_Enc --> Enc_Out
+    end
+
+    %% Split Quantization Subgraph
+    subgraph Split_Quant["Split residual vector quantization &amp; reconstruction"]
+        direction LR
+        Lin_VQ["Lin."]
+        VQ_Module["VQ"]
+        Lin_RVQ["Lin."]
+        RVQ_Module["RVQ"]
+
+        Quant_Sum(("⊕"))
+        Lin_Out1["Lin."]
+        Lin_Out2["Lin."]
+        Decoder_Sum(("⊕"))
+
+        Lin_VQ --> VQ_Module
+        Lin_RVQ --> RVQ_Module
+
+        %% Quantization streams
+        VQ_Module --> Stream_VQ["Quantized Stream (Semantic)"]
+        RVQ_Module --> Stream_RVQ1["Codebook Stream 1"]
+        RVQ_Module --> Stream_RVQ2["Codebook Stream 2"]
+        RVQ_Module --> Stream_RVQN["Codebook Stream N"]
+
+        Stream_VQ --> Quant_Sum
+        Stream_RVQ1 --> Quant_Sum
+        Stream_RVQ2 --> Quant_Sum
+        Stream_RVQN --> Quant_Sum
+
+        Stream_VQ --> Lin_Out1
+        Quant_Sum --> Lin_Out2
+
+        Lin_Out1 --> Decoder_Sum
+        Lin_Out2 --> Decoder_Sum
+    end
+
+    %% Neural Decoder Subgraph
+    subgraph Neural_Decoder["Neural decoder"]
+        direction LR
+        Transformer_Dec["Transformer"]
+        Feature_Dots_Dec["Feature Maps"]
+        ConvNet_Dec["ConvNet"]
+
+        Transformer_Dec --> Feature_Dots_Dec --> ConvNet_Dec
+    end
+
+    %% Distillation Loss Subgraph
+    subgraph Distillation_Module["Distillation"]
+        WavLM["WavLM"]
+        Lin_Distill["Lin."]
+        Cosine_Sim["Cosine similarity"]
+
+        WavLM --> Cosine_Sim
+        Lin_Distill --> Cosine_Sim
+    end
+
+    %% Adversarial Losses Subgraph
+    Adv_Loss["Adversarial losses"]
+
+    %% Direct Connections &amp; Data Flow
+    InputWave --> ConvNet_Enc
+    Enc_Out --> Lin_VQ
+    Enc_Out --> Lin_RVQ
+
+    %% Distillation Connections
+    InputWave -.-> WavLM
+    Stream_VQ -.-> Lin_Distill
+
+    %% Main Path to Decoder
+    Decoder_Sum --> Transformer_Dec
+    ConvNet_Dec --> OutputWave
+
+    %% Adversarial Loss Connections
+    InputWave -.- Adv_Loss
+    OutputWave -.- Adv_Loss
+
+    style Neural_Encoder fill:#11304a,stroke:#5aa9ff
+    style Split_Quant fill:#11304a,stroke:#5aa9ff
+    style Neural_Decoder fill:#11304a,stroke:#5aa9ff
+    style Distillation_Module fill:#11304a,stroke:#5aa9ff
+    style Adv_Loss fill:#11304a,stroke:#5aa9ff
+  </pre>
+</section>
+
+<!-- 5 · DETAILED PIPELINE -->
+<section class="slide fullflow">
+  <div class="time">1:00</div>
+  <h2>Detailed pipeline — where the JEPA prosody hits the decoder</h2>
+  <pre class="mermaid">
+graph LR
+    TXT["text"] --> CID["char ids"] --> TE["text encoder"] --> TF["text_feat (B,T,dim)"]
+    TXT --> BID["BPE ids"] --> BF["BPE feats"] -->|"gated add"| TF
+
+    REF["reference audio"] --> SE["speaker encoder"] --> SPK["spk latents (B,16,dim)"] --> SV["spk vec"]
+
+    TF --> APP["AR phoneme predictor"] --> PF["phoneme feats"]
+    PF --> FPHN["phoneme feats · FiLM (spk)"]
+    SV -.->|"spk"| FPHN
+
+    TF --> JEPA["prosody planner"]
+    JEPA --> LAT["prosody latent (B,32,dim)<br/>· exagg → plan"]
+    LAT --> FPRS["prosody plan · FiLM (spk)"]
+    SV -.->|"spk"| FPRS
+
+    FPHN --> LF["LinguisticFusion"]
+    TF --> LF
+    LF --> UT["unified text"]
+    FPRS --> CTX["CONTEXT<br/>[ spk vec · speaker-FiLM'd prosody · unified text ]"]
+    SV --> CTX
+    UT --> CTX
+
+    subgraph TRAIN["teacher · train only"]
+        PYIN["pyin → F0 / E / V"] --> PC["frozen ProsodyCodec"] --> GT["GT latent"]
+    end
+    REF --> PYIN
+    GT -.->|"cosine objective"| JEPA
+
+    CTX -->|"cross-attn + speaker AdaLN"| DEC["① AR layer<br/>cross-attn over CONTEXT<br/>(speaker AdaLN) → hidden"]
+    DEC --> DEP["② depformer (NAR)<br/>speaker + prosody AdaLN<br/>on codebook prediction"]
+    DEP --> RVQ["RVQ tokens (B,16,T)"] --> MIMI["Mimi decoder"] --> WAV["waveform"]
+
+    style CTX fill:#0f2f29,stroke:#0ca678,color:#e8eef7
+    style MIMI fill:#11304a,stroke:#5aa9ff
+    style TRAIN fill:#331f0c,stroke:#e8590c
+    style DEC fill:#13301f,stroke:#2f9e44
+    style DEP fill:#13301f,stroke:#2f9e44
+  </pre>
+  <ul style="margin-top:.8em;font-size:.9em">
+    <li><b>Where the JEPA prosody hits the decoder (twice):</b> ① as a block in the cross-attended <code>CONTEXT</code>; ② mean-pooled straight into the NAR depformer's AdaLN.</li>
+    <li><b>Unified linguistic fusion:</b> chars + BPE + explicit AR phonemes fold into one fused text; alignment is <b>attention-based</b> — no duration model drives timing.</li>
+    <li><b>Solid</b> = data flow · <b>dashed</b> = conditioning / supervision · 🟢 generation path · 🟠 frozen teacher (train only).</li>
+  </ul>
+</section>
+
+<!-- 6 · JEPA WORLD MODEL -->
+<section class="slide">
+  <div class="time">0:45</div>
+  <h2>The JEPA World Model — the "how"</h2>
+  <p class="lead" style="margin:.2em 0"><b>What is a JEPA?</b> A <b>Joint-Embedding Predictive Architecture</b> predicts <b>abstract latents, not raw signals</b> — it is supervised by a <b>similarity / energy objective</b> (cosine), never by reconstruction.</p>
+  <div class="callout" style="margin:.2em 0 .6em"><b>Why a JEPA — vs. a pure AR LLM:</b> an AR LLM must <b>re-generate every token</b>, so it guesses tone <b>token-by-token</b> and global intent drifts. A JEPA reads the <b>whole sentence first</b> (non-causal), spends no capacity on predictable acoustic detail, and returns a plan you can <b>sample and edit</b>.</div>
+  <div class="two">
+    <div>
+      <ul>
+        <li><b>Reads the whole text at once</b> (non-causal) — predicts a <b>global prosody latent</b> spanning the utterance, before the decoder runs.</li>
+        <li>Naturally parallel — reads the whole text at once, no slow per-token roll.</li>
+        <li>Supervised by a <b>frozen prosody codec</b> trained from expressive speech (F0/E/V → latent), via a cosine/planning objective.</li>
+        <li>Learned stochasticity → <b>sample plans</b> for controlled expressivity.</li>
+        <li>Contrastive (0.2) + learned-std regularizers fight <b>mean-collapse</b>, keeping plans text-discriminative.</li>
+      </ul>
+      <div class="callout" style="margin-top:.8em"><b>Result:</b> a sampled plan is followed as faithfully as ground truth — the latent is <b>informative, not decorative</b>.</div>
+    </div>
+    <div class="card">
+      <h4>Latent, not features</h4>
+      <p>F0/E/V feed only the frozen teacher. Generation conditions on the learned latent — <code class="mono">(B, 32, dim)</code>, mean-pooled/upsampled to the frame rate.</p>
+      <p class="mono" style="font-size:.85em;color:var(--dim)">jepa_layers=2 · jepa_heads=4 · plan (B, 32, dim) · teacher: frozen ProsodyCodec (F0/E/V → latent)</p>
+      <h4 style="margin-top:.8em">Layout in context</h4>
+      <p>Decoder context = <code class="mono">[speaker, adapted prosody, fused text]</code>.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 7 · WHO + VOICE -->
+<section class="slide">
+  <div class="time">0:45</div>
+  <h2>The "who" &amp; the voice — speaker conditioning + acoustic decoder</h2>
+  <div class="two">
+    <div class="card">
+      <h4>Dual-FiLM disentanglement</h4>
+      <p><b>FiLM</b> = <b>F</b>eature-wise <b>L</b>inear <b>M</b>odulation — two independent <span class="mono">FiLMAdapter</span>s turn the speaker latent into per-frame <b>scale γ / shift β</b>, then rescale-and-shift a feature:</p>
+      <p class="mono" style="font-size:.88em">Modulated = LayerNorm(x)·γ + β</p>
+      <ul style="font-size:.9em">
+        <li><code class="mono">film_phn</code> — <b>phoneme</b> embeddings → articulation / vocal tract.</li>
+        <li><code class="mono">film_prs</code> — <b>prosody</b> tokens → rhythm / intonation.</li>
+      </ul>
+      <p style="font-size:.84em;color:var(--muted)"><b>Why two?</b> One flat speaker vector would bundle articulation with prosody → <b>conditioning bleed</b>: cloned voices get the wrong rhythm, and prosody edits disturb articulation. Independent adapters each learn a clean job → <b>precise cloning, no bleed</b>.</p>
+    </div>
+    <div class="card">
+      <h4>AR Acoustic Decoder</h4>
+      <ul>
+        <li>Streaming transformer over <span class="mono">n_q=16</span> codebooks.</li>
+        <li><b>Cross-attention</b> to fused text + <b>speaker AdaLN</b> per layer.</li>
+        <li><b>Depformer</b> (NAR streaming transformer) predicts residual RVQ codebooks, with <b>speaker + prosody AdaLN</b>.</li>
+        <li>Mimi codec encodes waveform → token stream the decoder reconstructs.</li>
+      </ul>
+      <p class="mono" style="font-size:.85em;color:var(--dim)">dim=512 · layers=6 · depformer=10 · heads=8 · card=2048</p>
+    </div>
+  </div>
+</section>
+
+<!-- 8 · LOSSES & TESTS -->
+<section class="slide">
+  <div class="time">0:45</div>
+  <h2>Losses — every term has a job</h2>
+  <p class="lead">A four-term fusion loss keeps responsibilities split: the <b>"who"</b> is conditioned per layer in the AR decoder, <b>the "what"</b> stays grounded, and <b>the "how"</b> is plan-driven.</p>
+  <table>
+    <tr><th>Loss</th><th>Enforces</th></tr>
+    <tr><td class="mono">loss_ar ×1.0</td><td>Audio quality: cross-entropy over each enabled RVQ codebook — curriculum <b>4 → 16 codebooks</b> over 50k steps.</td></tr>
+    <tr><td class="mono">loss_ph ×0.5</td><td><b>The "what"</b>: cross-entropy on the phoneme head (vocab 128) — pronunciation stays grounded even with fused text.</td></tr>
+    <tr><td class="mono">loss_jepa ×2.0</td><td><b>The "how"</b>, three terms: ① <span class="mono">1−cos(plan, GT latent)</span> — the plan must <b>point like</b> the true prosody; ② <span class="mono">contrastive gap 0.2</span> — no mean-collapse, text-discriminative plans; ③ <span class="mono">learned-std 0.05</span> — expressive variety at generation, no explosion.</td></tr>
+    <tr><td class="mono">loss_cycle ×0.5</td><td><b>Plan-follow</b>: cos(prosody of the <i>generated</i> audio, the plan) — the decoder is forced to <i>use</i> the latent, not read text.</td></tr>
+  </table>
+  <p style="font-size:.85em;color:var(--dim);margin-top:.4em">Every responsibility has a targeted repo test — smoke train · Mimi fidelity · pitch sweep · g2p correctness · the plan-follow trio (<span class="mono">gen_ar · plan_cos · follow_cos</span>) scored every eval.</p>
+</section>
+
+<!-- 9 · RESULTS -->
+<section class="slide">
+  <div class="time">0:45</div>
+  <h2>Results — the plan is followed, not ignored</h2>
+  <p class="lead">Measured across <b>200 evaluation batches (2,000 sentences)</b>. One reference speaker, generated on a single RTX 5090.</p>
+  <p class="lead" style="font-size:.95em">How to read: audio-token loss — <b>lower is better</b>; cosine distance — <b>0 = identical → 1 = unrelated</b>. <span class="mono">plan_cos</span> = <b>sampled plan vs. true prosody</b>; <span class="mono">follow_cos</span> = <b>rendered audio vs. the plan</b>.</p>
+  <table>
+    <tr><th>Metric</th><th class="num">Value</th><th>What it means</th></tr>
+    <tr><td class="mono">ar</td><td class="num">1.070</td><td>Quality with <b>ground-truth</b> prosody — the best-case ceiling.</td></tr>
+    <tr><td class="mono">gen_ar</td><td class="num">1.070</td><td>Quality with a <b>JEPA-sampled</b> plan — <span class="up">same as the ceiling.</span></td></tr>
+    <tr><td class="mono">plan_cos</td><td class="num">0.237</td><td>Cosine distance — <b>sampled plan vs. true prosody</b>: how well the planner predicted the real prosody. Well-aligned, with room for variation.</td></tr>
+    <tr><td class="mono">follow_cos</td><td class="num">0.317</td><td>Cosine distance — <b>rendered audio's prosody vs. the plan</b>: how faithfully the decoder followed it. Close enough that quality is unchanged.</td></tr>
+  </table>
+  <div class="callout"><b>The key result:</b> <code>gen_ar == ar</code> (both 1.070). If the decoder ignored the plan and just read text, <code>gen_ar</code> would be worse. It isn't — <b>no text-only shortcut collapse</b>. The prosody latent is genuinely informative.</div>
+</section>
+
+<!-- 10 · WHAT WORKED -->
+<section class="slide">
+  <div class="time">0:30</div>
+  <h2>What finally worked</h2>
+  <p class="lead">Three failure modes at first — text-only shortcut collapse, a prosody-lean AR head, planner mean-collapse — each broken by a targeted fix:</p>
+  <table>
+    <tr><th>Fix</th><th>Mechanism</th></tr>
+    <tr><td class="mono">GT / mix teacher-forcing</td><td>Condition the decoder on <b>GT prosody half the time</b> (<code>decoder_prosody_source='mix'</code>, <code>decoder_gt_prob=0.5</code>) so it <i>learns</i> latent→audio; sample a plan the rest to keep inference in-distribution.</td></tr>
+    <tr><td class="mono">Contrastive + std</td><td>The regularizers from the JEPA intro — a matched-vs-mismatched contrastive gap (<code>0.2</code>) and a learned-std pull (<code>0.05</code>) — cure failure <b>3</b>: measured text-discriminative, not average.</td></tr>
+    <tr><td class="mono">Direct depformer AdaLN</td><td>Inject mean-pooled prosody <b>straight into the NAR codebook predictor</b> (<code>use_dep_prosody_cond</code>) — bypass the prosody-lean AR hidden path.</td></tr>
+    <tr><td class="mono">Exagg dial (inference)</td><td>Interpolate <code>null ↔ sampled</code> plan around the null latent — expressiveness control without retraining.</td></tr>
+    <tr><td class="mono">Cycle loss</td><td>Compare the <i>generated</i> prosody against the plan it was conditioned on — the direct measurement that plans are followed.</td></tr>
+  </table>
+</section>
+
+<!-- 11 · FRUGALITY -->
+<section class="slide">
+  <div class="time">0:30</div>
+  <h2>Frugal &amp; controllable by design</h2>
+  <div class="two">
+    <div class="card"><h4>Hardware democratization</h4>
+      <ul>
+        <li>Trains &amp; runs on <b>RTX 30 / 40 / 50</b> consumer GPUs.</li>
+        <li><b>Fully local &amp; offline</b> — your data, your process, your output.</li>
+        <li>Zero-cost iteration — no usage credits.</li>
+      </ul>
+    </div>
+    <div class="callout"><b>Educational thesis:</b> SOTA-quality speech on a gaming laptop makes frontier voice technology <b>approachable, sovereign, and hackable</b> for students and researchers.</div>
+  </div>
+  <p style="font-size:.9em;color:var(--dim);margin-top:.8em">Controls without retraining: <b>LoRA</b> voice cloning · <b>CFG</b> text/reference fidelity · <span class="mono">exagg</span> expressive dial · per-stage temperature — all at inference, <b>&lt;400 ms</b>.</p>
+</section>
+
+<!-- 12 · LISTEN -->
+<section class="slide">
+  <div class="time">0:45</div>
+  <h2>Listen</h2>
+  <p class="lead">One reference speaker — generated on a single RTX 5090.</p>
+  <div class="sample">
+    <span class="tag">10-sentence demo</span>
+    <p class="text">A narrative announcing SeedVox's architecture, JEPA prosody planning, and key results.</p>
+    <audio controls preload="none" src="docs/seedvox_demo.mp3"></audio>
+    <p class="desc">All prosody is sampled from the JEPA world model — no manual tuning.</p>
+  </div>
+  <div class="callout" style="margin:.6em 0"><b>Intelligibility guard:</b> the demo is Whisper-scored vs its reference text — <b>~6% WER</b> (14/222 words). Every edit is the recognizer misreading out-of-vocabulary names (<span class="mono">SeedVox</span>→seedbox, <span class="mono">JEPA</span>→jeppo) — the spoken words are intact.</div>
+  <div class="card"><h4 style="color:var(--accent)">A note on the reference voice</h4>
+    <p>The reference voice and the training data come from <b>LJ Speech</b> — a single-speaker <b>audiobook</b> corpus: <b>read speech</b>, monotone, low expressiveness. Expressive conversational reference data will sound considerably more natural and dynamic.</p>
+  </div>
+</section>
+
+<!-- 13 · ROADMAP -->
+<section class="slide">
+  <div class="time">0:30</div>
+  <h2>Roadmap</h2>
+  <p class="lead">Done: the hybrid AR-JEPA baseline — an autoregressive <b>discrete-transformer</b> decoder + JEPA + frozen prosody teacher, dual-FiLM conditioning, plan-follow verified (<code>gen_ar == ar</code>).</p>
+  <div class="grid g3" style="grid-template-columns:1fr">
+    <div class="card"><h4><span class="tag">next · data</span> Expressive conversational corpora</h4>
+      <p>Longer-form context, richer prosody, real dialog structure — with <b>natural-language emotion &amp; style tags</b> embedded in the text. Such datasets are emerging as TTS shifts toward expressive, multi-speaker dialogue.</p></div>
+    <div class="card"><h4><span class="tag">beyond</span> Continuous-latent acoustic decoder</h4>
+      <p>A flow-matching decoder over Mimi latents so the prosody signal lands without a codebook-quantization bottleneck.</p></div>
+    <div class="card"><h4><span class="tag">beyond</span> Streamability &amp; full-duplex</h4>
+      <p>Chunk-wise streaming inference and a <b>full-duplex spoken channel</b> — listen and speak simultaneously, for real-time conversation.</p></div>
+  </div>
+</section>
+
+<!-- 14 · CLOSING -->
+<section class="slide">
+  <div class="time">0:30</div>
+  <h2>Takeaways</h2>
+  <ul>
+    <li>SeedVox is <b>smarter speech AI</b>: structural priors instead of brute-force scale — separate the <b>"what"</b> (AR phonemes) from the <b>"how"</b> (JEPA prosody) and the <b>"who"</b> (speaker).</li>
+    <li><b>Unified linguistic fusion:</b> characters + BPE subwords + explicit <b>AR phoneme planning</b> converge into one text representation the model plans from.</li>
+    <li>Measured: the decoder <b>follows the plan</b> (<code>gen_ar == ar</code>); no text-shortcut collapse.</li>
+    <li><b>Fully open-sourced</b> — training, inference, and model configurations all included; <b>284M parameters</b> including the speech renderer, <b>&lt;400 ms</b> inference on a consumer GPU, Apache 2.0.</li>
+    <li>It's getting attention — <b>+25k views on LinkedIn</b> and <b>PhD students reaching out to collaborate</b>.</li>
+  </ul>
+  <div class="callout"><b>What you say, how you say it, who says it — planned before it is spoken.</b><br>
+  <span class="mono" style="color:var(--dim)">github.com/v7aresky/seedvox · https://v7aresky.github.io/seedvox/ — listen, build, and reach out.</span></div>
+</section>
+
+</div>
+
+<div class="nav">
+  <button onclick="go(-1)">‹ Prev</button>
+  <button onclick="go(1)">Next ›</button>
+</div>
+
+<script>
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  let cur = 0;
+  const dots = document.getElementById('dots');
+  slides.forEach((_,i)=>{const d=document.createElement('button');d.className='dot';d.onclick=()=>show(i);dots.appendChild(d);});
+  function show(i){
+    cur=Math.max(0,Math.min(slides.length-1,i));
+    slides.forEach((s,k)=>s.classList.toggle('active',k===cur));
+    Array.from(dots.children).forEach((d,k)=>d.classList.toggle('active',k===cur));
+    document.getElementById('counter').textContent=(cur+1)+' / '+slides.length;
+    document.getElementById('progress').style.width=((cur+1)/slides.length*100)+'%';
+    window.dispatchEvent(new Event('slidechange'));
+  }
+  function go(d){show(cur+d)}
+  document.addEventListener('keydown',e=>{
+    if(['ArrowRight','PageDown',' ','Enter'].includes(e.key))go(1);
+    else if(['ArrowLeft','PageUp'].includes(e.key))go(-1);
+    else if(e.key==='Home')show(0); else if(e.key==='End')show(slides.length-1);
+  });
+  let tx=null;document.addEventListener('touchstart',e=>tx=e.touches[0].clientX);
+  document.addEventListener('touchend',e=>{const dx=e.changedTouches[0].clientX-tx;if(Math.abs(dx)>40)go(dx<0?1:-1);});
+  show(0);
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  if (window.mermaid) {
+    mermaid.initialize({
+      startOnLoad: true,
+      securityLevel: 'loose',
+      theme: 'base',
+      themeVariables: {
+        background: 'transparent', primaryColor: '#1c2a3a',
+        primaryBorderColor: '#2a3a4e', primaryTextColor: '#e8eef7',
+        lineColor: '#6f8499', textColor: '#9fb3c8',
+        edgeLabelBackground: '#16212e', fontSize: '15px'
+      },
+      flowchart: { curve: 'basis', htmlLabels: true }
+    });
+  } else {
+    document.querySelectorAll('.mermaid').forEach(el => {
+      el.style.whiteSpace = 'pre';
+      el.style.fontFamily = 'var(--mono)';
+    });
+  }
+</script>
+
+<script>
+(function(){
+  if(!document.querySelector('.mermaid')) return;
+  function setScale(block,scale){
+    var svg=block.querySelector('svg'),nat=block._nat;
+    svg.style.width=(nat.w*scale)+'px';
+    svg.style.height=(nat.h*scale)+'px';
+    block._s=scale;
+    var el=block.querySelector('.mzb span');if(el)el.textContent=Math.round(scale*100)+'%';
+  }
+  function fitGraph(block){
+    if(!block._nat)return;
+    var cw=block.clientWidth-(parseFloat(getComputedStyle(block).paddingLeft)||0)-(parseFloat(getComputedStyle(block).paddingRight)||0);
+    var top=block.offsetTop||0,avail=window.innerHeight-top-40;
+    var all=block.parentNode?block.parentNode.querySelectorAll('.mermaid'):[];
+    var totH=0;for(var k=0;k<all.length;k++){if(all[k]&&all[k]._nat)totH+=all[k]._nat.h;}
+    var ratio=totH>0?(block._nat.h/totH):(1/Math.max(1,all.length));
+    var budget=avail*ratio;
+    var ch=Math.max(120,Math.min(window.innerHeight*0.92,budget));
+    var s=Math.min(cw/block._nat.w, ch/block._nat.h, 1);
+    setScale(block,(isFinite(s)&&s>0)?s:1);
+  }
+  function isFull(block){var sec=block.closest&&block.closest('.slide');return sec&&(sec.classList.contains('fullflow')||sec.classList.contains('vstack'));}
+  function init(block){
+    var svg=block.querySelector('svg');
+    if(!svg||block._done)return;block._done=1;
+    svg.style.maxWidth='none';
+    var vb=svg.viewBox.baseVal;
+    block._nat={w:vb.width||100,h:vb.height||100};
+    var bar=document.createElement('div');bar.className='mzb';
+    function btn(t,title,fn){var b=document.createElement('button');b.textContent=t;b.title=title;b.onclick=fn;bar.appendChild(b);}
+    var pct=document.createElement('span');
+    btn('\u2212','zoom out',function(){setScale(block,Math.max(.25,(block._s||1)/1.25));});
+    btn('+','zoom in',function(){setScale(block,Math.min(5,(block._s||1)*1.25));});
+    btn('1:1','actual size',function(){setScale(block,1);});
+    btn('fit','fit to screen',function(){fitGraph(block);});
+    bar.appendChild(pct);
+    block.insertBefore(bar,svg);
+    isFull(block) ? setScale(block,1) : fitGraph(block);
+    block.addEventListener('wheel',function(e){
+      if(!e.ctrlKey)return;
+      e.preventDefault();
+      setScale(block,Math.min(5,Math.max(.25,(block._s||1)*(e.deltaY<0?1.18:1/1.18))));
+    },{passive:false});
+    var down=null;
+    block.addEventListener('mousedown',function(e){if(e.target.closest('.mzb'))return;down={x:e.clientX,y:e.clientY,l:block.scrollLeft,t:block.scrollTop};block.classList.add('panning');});
+    block.addEventListener('mousemove',function(e){if(!down)return;block.scrollLeft=down.l-(e.clientX-down.x);block.scrollTop=down.t-(e.clientY-down.y);});
+    block.addEventListener('mouseup',function(){down=null;block.classList.remove('panning');});
+    block.addEventListener('mouseleave',function(){down=null;block.classList.remove('panning');});
+  }
+  function scan(){document.querySelectorAll('.mermaid').forEach(init);}
+  var tries=0;
+  (function poll(){scan();if(document.querySelectorAll('.mermaid svg').length<document.querySelectorAll('.mermaid').length&&tries++<80){setTimeout(poll,100);}})();
+  window.addEventListener('slidechange',function(){
+    scan();
+    document.querySelectorAll('.mermaid').forEach(function(b){
+      if(b._done&&!isFull(b)&&!b._fitted){fitGraph(b);b._fitted=1;}
+    });
+  });
+  window.addEventListener('resize',function(){
+    document.querySelectorAll('.mermaid').forEach(function(b){if(b._done&&!isFull(b))fitGraph(b);});
+  });
+})();
+</script>
+</body>
+</html>

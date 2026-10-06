@@ -81,6 +81,17 @@ def get_mimi_model(device='cpu', checkpoint_path=None, num_codebooks=16):
         freeze_encoder=True
     ).to(device=device)
     
+    # Auto-detect pretrained Mimi checkpoint
+    if checkpoint_path is None:
+        default_paths = [
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "pretrained_models", "best_mimi.pt"),
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "checkpoints", "best_mimi.pt"),
+        ]
+        for p in default_paths:
+            if os.path.exists(p):
+                checkpoint_path = p
+                break
+
     if checkpoint_path is not None:
         if not os.path.exists(checkpoint_path):
             print(f"Warning: No checkpoint found at {checkpoint_path}")
@@ -93,7 +104,7 @@ def get_mimi_model(device='cpu', checkpoint_path=None, num_codebooks=16):
             state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
         else:
             raise ValueError(f"Unsupported file extension: {ext}")
-        
+
         model.load_state_dict(state_dict, strict=False)
         
     return model

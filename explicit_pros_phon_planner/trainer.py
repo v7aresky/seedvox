@@ -9,8 +9,11 @@ from .model import ExplicitPlannerModel
 from .utils import PhoneticGenerator, collate_phonemes
 
 class ExplicitCollate:
-    def __init__(self, ph_generator):
+    def __init__(self, ph_generator, bpe_collator=None, leading_pause=False, pause_phone_id=88):
         self.ph_generator = ph_generator
+        self.bpe_collator = bpe_collator
+        self.leading_pause = leading_pause
+        self.pause_phone_id = pause_phone_id
         self.failure_count = 0
         self.total_batches = 0
         self.failure_threshold = 0.1 # Stop if more than 10% of batches fail
@@ -22,27 +25,41 @@ class ExplicitCollate:
 
         # 2. Use precomputed phonemes if available
         if ph_ids_from_ds is not None:
-             return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_ids_from_ds, prosody_feat
-
-        # 3. Parallel G2P (Fallback)
-        try:
-            ph_target_list = self.ph_generator.generate_targets_batch(raw_texts, normalize=False)
-            ph_targets = collate_phonemes(ph_target_list)
-        except Exception as e:
-            self.failure_count += 1
-            failure_rate = self.failure_count / self.total_batches
-            print(f"Error in Parallel G2P worker: {e}. Failure rate: {failure_rate:.2%}")
-
-            if failure_rate > self.failure_threshold:
-                raise RuntimeError(f"G2P failure rate exceeded threshold!")
-
+             ph_targets = ph_ids_from_ds
+        else:
+            # 3. Parallel G2P (Fallback)
             try:
-                ph_target_list = [self.ph_generator.generate_targets(text, normalize=False) for text in raw_texts]
+                ph_target_list = self.ph_generator.generate_targets_batch(raw_texts, normalize=False)
                 ph_targets = collate_phonemes(ph_target_list)
-            except Exception as e2:
-                ph_targets = torch.zeros((len(raw_texts), 2), dtype=torch.long)
+            except Exception as e:
+                self.failure_count += 1
+                failure_rate = self.failure_count / self.total_batches
+                print(f"Error in Parallel G2P worker: {e}. Failure rate: {failure_rate:.2%}")
 
-        return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, prosody_feat
+                if failure_rate > self.failure_threshold:
+                    raise RuntimeError(f"G2P failure rate exceeded threshold!")
+
+                try:
+                    ph_target_list = [self.ph_generator.generate_targets(text, normalize=False) for text in raw_texts]
+                    ph_targets = collate_phonemes(ph_target_list)
+                except Exception as e2:
+                    ph_targets = torch.zeros((len(raw_texts), 2), dtype=torch.long)
+
+        # 4. Leading silence phone: prepend a pause phone right after the SOS so
+        # the phone/planner side has an explicit "nothing-yet" interval to learn
+        # for the audio-onset runway (see config leading_silence.phone_pause).
+        if self.leading_pause and ph_targets is not None and ph_targets.shape[1] > 1:
+            B_ph = ph_targets.shape[0]
+            pause = torch.full((B_ph, 1), self.pause_phone_id, dtype=torch.long)
+            ph_targets = torch.cat([ph_targets[:, :1], pause, ph_targets[:, 1:]], dim=1)
+
+        # 5. BPE tokenization in the worker process (parallel across workers),
+        # off the GPU/MainThread critical path.
+        bpe_ids, bpe_lens, char_to_bpe = None, None, None
+        if self.bpe_collator is not None:
+            bpe_ids, bpe_lens, char_to_bpe = self.bpe_collator.process_batch_texts(raw_texts, t_lens, device='cpu')
+
+        return padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, prosody_feat, bpe_ids, bpe_lens, char_to_bpe
 
 class ExplicitTrainer(SeedVoxTrainer):
     """
@@ -142,7 +159,7 @@ class ExplicitTrainer(SeedVoxTrainer):
         )
 
     def _compute_loss(self, batch):
-        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, _prosody_feat = batch
+        padded_text, padded_audio, t_lens, a_lens, raw_texts, ph_targets, _prosody_feat, *_ = batch
         
         padded_text = padded_text.to(self.device)
         padded_audio = padded_audio.to(self.device)

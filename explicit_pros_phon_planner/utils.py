@@ -1,8 +1,76 @@
+import os
 import torch
 import re
 from seedvox.utils.tokenizer import PhonemeTokenizer
 from seedvox.utils.text import normalize_text
 from seedvox.utils.g2p_factory import get_phoneme_generator
+
+# Leading-pause phone id: PhonemeTokenizer maps the literal space ' ' to this id.
+# It is already a common phone in the precomputed ph_ids (word separators), so a
+# prepended leading pause is fully in-vocabulary. Used by the leading-silence
+# phone hook (phoneme side of the onset-runway design).
+PAUSE_PHONE_ID = 88
+
+
+def attach_leading_sil_codes(model, cfg, device=None):
+    """Attach the leading-silence runway codes to a model instance.
+
+    Reads ``cfg['training']['leading_silence']`` and, if active, sets
+    ``model.leading_sil_codes`` (real mimi silence codes, cached to disk).
+    Every inference entry point (infer, batch_infer, eval scripts) should call
+    this after loading the model so sampling matches training; the model itself
+    also self-attaches lazily on first forward/sample as a safety net.
+    Returns True if the runway was attached.
+    """
+    lsil = (cfg.get('training') or {}).get('leading_silence', {}) or {}
+    frames = int(lsil.get('audio_frames', 0))
+    if frames <= 0:
+        return False
+    nq = cfg['model']['n_q']
+    if device is None:
+        device = next(model.parameters()).device
+    cache_path = os.path.join('checkpoints', f'silence_runway_{nq}q_{frames}f.pt')
+    model.leading_sil_codes = compute_silence_codes(
+        device, n_q=nq, frames=frames, cache_path=cache_path).to(device)
+    return True
+
+
+def compute_silence_codes(device, n_q, frames, checkpoint_path=None, cache_path=None):
+    """Encode `frames` mimi codec frames of digital silence -> [n_q, frames].
+
+    Real codec codes are required so the AR head is trained to *emit* the exact
+    same codes at the onset runway that sampling later *injects*, and so the NAR
+    depformer learns a consistent residual-codebook prior for them. Mimi is only
+    needed at startup (trainer/infer); the codes are cached to disk so a live
+    trainer does not hold the codec in memory. Result is cloned onto `device`.
+    """
+    from seedvox.modules.mimi import get_mimi_model
+
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    if cache_path is not None and os.path.exists(cache_path):
+        return torch.load(cache_path, map_location=device, weights_only=True).to(device)
+
+    print(f"[silence_codes] encoding {frames} frames of silence (mimi n_q={n_q})...")
+    mimi = get_mimi_model(device=device, checkpoint_path=checkpoint_path, num_codebooks=n_q)
+    sr = int(mimi.sample_rate)
+    fr = float(mimi.frame_rate)
+    n_samples = int(round(frames / fr * sr)) + int(sr / fr)  # +1 frame of slack
+    wav = torch.zeros((1, 1, n_samples), dtype=torch.float32, device=device)
+    with torch.no_grad():
+        codes = mimi.encode(wav)[0]  # [32, T]
+    codes = codes[:n_q, :frames].contiguous().long()
+    if codes.shape[-1] != frames:
+        raise RuntimeError(f"mimi silence encode produced {codes.shape[-1]} frames, wanted {frames}")
+    del mimi
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    if cache_path is not None:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        torch.save(codes.cpu(), cache_path)
+        print(f"[silence_codes] cached -> {cache_path}")
+    return codes
 
 
 def extract_ref_prosody_latent(wav_path, model, device):
